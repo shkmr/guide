@@ -1,0 +1,1908 @@
+(define debug? #f)
+(use srfi-1)
+(use srfi-13)
+(use gauche.process)
+(use gauche.vport)
+(use file.util)
+(use text.diff)
+(use ggc.file.util)
+(use ggc.util.circular-list)
+(use ggc.term.with-raw-mode)
+(use ggc.text.segment)
+
+;;;
+(define (get-real-time)
+  (receive (sec usec) (sys-gettimeofday)
+    (+ sec (* usec 1e-6))))
+
+(define-condition-type <quit> <message-condition> #f)
+
+(define (quit . args)
+  (apply error (cons <quit> args)))
+;;;
+;;;  TEXT-BUFFER CLASS
+;;;
+(define-class <text-buffer> ()
+  ((text      :init-value   '() 
+              :init-keyword :text        
+              :accessor text-of)
+   (point     :init-value   0 
+              :accessor point-of)
+   (mark      :init-value   0
+              :accessor mark-of)
+   (name      :init-value #f
+              :init-keyword :name 
+              :accessor name-of)
+   (follow    :init-value #f
+              :accessor follow-cursor?)
+   (persistent :init-value #f
+               :accessor is-persistent?)
+   (modified? :init-value #f
+              :accessor is-modified?)
+   (readonly? :init-value #f
+              :accessor is-readonly?)
+   (lmtime    :init-value 0.0
+              :accessor last-modified-time-of)
+   (filename  :init-value #f 
+              :accessor filename-of)
+   (fmtime    :init-value 0 ; mtime of the file last visited or saved.
+              :accessor mtime-of)
+   (history   :init-value '()
+              :init-keyword :history 
+              :accessor history-of)
+   (key-map   :init-value #f
+              :accessor key-map-of
+              :init-keyword :key-map)
+   ))
+
+(define (reinitialize-buffer buf)
+  (set! (text-of buf)       '())
+  (set! (point-of buf)       0)
+  (set! (mark-of buf)        0)
+  (set! (name-of buf)        #f)
+  (set! (follow-cursor? buf) #f)
+  (set! (is-persistent? buf) #f)
+  (set! (is-modified? buf)   #f)
+  (set! (is-readonly? buf)   #t)
+  (set! (last-modified-time-of buf) 0)
+  (set! (filename-of buf)    #f)
+  (set! (mtime-of buf)       0)
+  (set! (history-of buf)    '())
+  (set! (key-map-of buf)    #f)
+  )
+
+
+(define-method error-if-readonly ((buf <text-buffer>))
+  (if (is-readonly? buf) 
+      (quit "Read only buffer")))
+
+(define (update-buffer buf update pos arg)
+  (error-if-readonly buf)
+  (if (not (eq? arg 0))
+      (let ((current-time    (get-real-time))
+            (last-modified   (last-modified-time-of buf))
+            (new-text        (update (text-of buf) pos arg)))
+        (set! (text-of buf) new-text)
+        (cond ((> (- current-time last-modified) 0.2)
+               (set! (last-modified-time-of buf) current-time)
+               (set! (is-modified? buf) #t)
+               (buffer-push-history buf))))))
+
+(define (buffer-flatten-text buf)
+  (set! (text-of buf) (list (text->string (text-of buf)))))
+
+(define (buffer-replace-text buf text)
+  (update-buffer buf (lambda (buf pos arg) text) 0 1)
+  (set! (point-of buf) 0)
+  (set! (mark-of buf) 0))
+
+(define-method region->string ((buf <text-buffer>)
+                              (from <integer>)
+                              (to   <integer>))
+  (cond ((> from to) (region->string buf to from))
+        ((= from to) "")
+        (else
+         (text->string (text-get-text (text-of buf) from (- to from))))))
+
+(define-method region->string ((buf <text-buffer>))
+  (region->string buf (point-of buf) (mark-of buf)))
+
+(define (buffer-let-window-always-follow-point buf)
+  (set! (follow-cursor? buf) #t))
+
+(define (buffer-make-persistent buf)
+  (set! (is-persistent? buf) #t))
+
+(define (buffer-set-filename buf fname)
+  (set! (filename-of buf) fname)
+  (if (file-is-regular? fname)
+      (buffer-set-mtime buf)))
+
+(define (buffer-set-mtime buf)
+  (if (filename-of buf)
+      (let ((mtime (sys-stat->mtime (sys-stat (filename-of buf)))))
+        (set! (mtime-of buf) mtime)
+        (set! (last-modified-time-of buf) mtime))
+      (quit "buffer is not associated with file")))
+
+(define (buffer-match-mtime? buf)
+  (and (mtime-of buf)
+       (filename-of buf)
+       (= (mtime-of buf)
+          (sys-stat->mtime (sys-stat (filename-of buf))))))
+
+(define (buffer-load-from-file buf fname)
+  (if (and (file-exists? fname)
+           (file-is-regular? fname))
+      (let ((str (file->string fname)))
+        (buffer-replace-text buf (list str))
+        (set! (is-modified? buf) #f)
+        (if (file-is-readonly? fname)
+            (set! (is-readonly? buf) #t))
+        (buffer-set-filename buf fname)
+        (set! (history-of buf) '())
+        (buffer-push-history buf))
+      (quit "Could not read file")))
+
+(define (buffer-save-to-file buf fname)
+  (buffer-flatten-text buf)
+  (call-with-output-file fname
+    (lambda (p) (display (car (text-of buf)) p)))
+  (set! (is-modified? buf) #f)
+  (buffer-set-filename buf fname)
+  (message "Wrote ~s" fname))
+
+(define (buffer-erase buf)
+  (buffer-replace-text buf '())
+  (set! (history-of buf) '())
+  (set! (is-modified? buf) #f))
+
+(define-method line-number-of ((buf <text-buffer>))
+  (let ((text (text-of buf))
+        (pos  (point-of buf)))
+    (text-line-number text pos)))
+
+(define-method number-of-lines-of ((buf <text-buffer>))
+  (text-number-of-lines (text-of buf) 0))
+
+;;;
+;;;  HISTORY
+;;;
+(define-class <text-moment> ()
+  ((point :init-value 0
+          :init-keyword :point
+          :accessor point-of)
+   (text  :init-value '()
+          :init-keyword :text
+          :accessor text-of)
+   (mtime :init-value 0
+          :init-keyword :mtime
+          :accessor mtime-of)))
+
+(define-method make-moment ((buf <text-buffer>))
+  (make <text-moment>
+    :point (point-of buf) 
+    :text  (text-of buf)
+    :mtime (last-modified-time-of buf)))
+
+(define (history-find-mtime history mtime)
+  (circular-find history
+                 (lambda (moment)
+                   (= mtime (mtime-of moment)))))
+
+(define (history-find-last-saved history)
+  (circular-find history
+                 (lambda (moment) 
+                   (integer? (mtime-of moment)))))
+
+(define (buffer-push-history buf)
+  (if (null? (history-of buf))
+      (set!  (history-of buf) (circular-list (make-moment buf)))
+      (circular-push! (history-of buf) (make-moment buf))))
+
+(define (buffer-pop-history buf)
+  ;; so called ``undo''
+  (if (null? (history-of buf))
+      (quit "buffer does not have history")
+      (let ((moment (circular-pop! (history-of buf))))
+        (set! (is-modified? buf) #t)
+        (set! (point-of buf) (point-of moment))
+        (set! (text-of buf)  (text-of  moment)))))
+
+(define-method find-history-by-mtime ((buf <text-buffer>)  mtime)
+  (history-find-mtime (history-of buf) mtime))
+
+(define-method find-last-saved-history ((buf <text-buffer>) n)
+  (let ((his (history-find-last-saved (history-of buf))))
+    (if his
+        (dotimes (x (+ (quotient n 4)))
+          (set! his (history-last-saved (cdr his)))))
+    his))
+
+;;;
+;;;   TEXT BUFFER PORT
+;;;
+(define-class <input-text-buffer-port> (<virtual-input-port>)
+  ((text-buffer :init-keyword :text-buffer
+                :accessor text-buffer-of)))
+
+(define-class <output-text-buffer-port> (<virtual-output-port>)
+  ((text-buffer :init-keyword :text-buffer
+                :accessor text-buffer-of)))
+   
+(define (open-input-text-buffer buf)
+  (let ((port (make <input-text-buffer-port> :text-buffer buf)))
+    (define (getc)
+      (let ((ch (text-get-character (text-of  buf)
+                                    (point-of buf))))
+        (if ch (inc! (point-of buf)))
+        ch))
+    (slot-set! port 'getc getc)
+    port))
+
+(define (open-output-text-buffer buf)
+  (let ((port (make <output-text-buffer-port> :text-buffer buf)))
+    (define (putc ch)
+      (insert (text-buffer-of port) (string ch)))
+    (define (puts str)
+      (insert (text-buffer-of port) str))
+    (slot-set! port 'putc putc)
+    (slot-set! port 'puts puts)
+    port))
+
+(define-method with-output-to ((buf  <text-buffer>)
+                               (thunk <procedure>))
+  (let ((port #f))
+    (dynamic-wind
+        (lambda () (set! port (open-output-text-buffer buf)))
+        (lambda () (with-output-to-port port thunk))
+        (lambda () (close-output-port port)))))
+
+(define-method with-input-from ((buf <text-buffer>)
+                                (thunk <procedure>))
+  (let ((port #f))
+    (dynamic-wind
+        (lambda () (set! port (open-input-text-buffer buf)))
+        (lambda () (with-input-from-port port thunk))
+        (lambda () (close-input-port port)))))
+
+;;;
+;;;
+;;;
+(define-syntax define-command
+  (syntax-rules ()
+    ((_ sym (buf) body ...)
+     (begin
+       (define-method sym ((buf <text-buffer>)
+                           _)
+         body ...)
+       (define-method sym ((buf <text-buffer>))
+         (sym buf 1))
+       (define-method sym ((name <string>))
+         (sym (get-buffer name)))
+       (define-method sym (_)
+         (sym (current-buffer) _))
+       (define-method sym ()
+         (sym (current-buffer) 1))))
+    ((_ sym (buf arg) body ...)
+     (begin
+       (define-method sym ((buf <text-buffer>) arg)
+         body ...)
+       (define-method sym ((buf <text-buffer>))
+         (sym buf 1))
+       (define-method sym ((name <string>))
+         (sym (get-buffer name) 1))
+       (define-method sym (arg)
+         (sym (current-buffer) arg))
+       (define-method sym ()
+         (sym (current-buffer) 1))))))
+
+(define-command set-mark-command (buf)
+  (set! (mark-of buf) (point-of buf))
+  (message "Mark Set"))
+
+(define-command exchange-point-and-mark (buf)
+  (let ((p (point-of buf))
+        (m (mark-of buf)))
+    (set! (point-of buf) m)
+    (set! (mark-of buf) p)))
+
+(define-command point (buf) (point-of buf))
+(define (point-min . x)  0)
+(define-command point-max (buf) (text-size (text-of buf)))
+
+;;;
+;;;  BUFFER MANAGEMENT
+;;;
+(define (make-unique-buffer-name name)
+  (let lp ((candidate name)
+           (n 1))
+    (cond ((get-buffer candidate)
+           (lp (format #f "~a<~d>" name n) 
+               (+ n 1)))
+          (else candidate))))
+
+(define (make-buffer name)
+  (let ((buf (make <text-buffer> 
+               :name (make-unique-buffer-name name)
+               :key-map (copy-key-map (global-key-map-of the-editor)))))
+    (circular-append! (buffers-of the-editor) buf)
+    buf))
+
+
+(define (remove-buffer-from-the-editor buf)
+  (if (eq? buf (current-buffer))
+      (circular-pop! (buffers-of the-editor))
+      (let ((cbuf (current-buffer)))
+        (select-buffer buf)
+        (circular-pop! (buffers-of the-editor))
+        (select-buffer cbuf))))
+
+(define (kill-buffer-function buf)
+
+  (define (remove-buffer-from-windows buf)
+    (for-each (lambda (frame)
+              (for-each (lambda (win)
+                          (if (eq? buf (buffer-of win) )
+                              (set! (buffer-of win) (current-buffer))))
+                        (windows-of frame)))
+            (frames-of the-editor)))
+
+  (cond ((is-persistent? buf) (quit "You can't kill this buffer"))
+        (else (reinitialize-buffer buf)
+              (remove-buffer-from-the-editor buf)
+              (remove-buffer-from-windows buf))))
+
+(define (kill-buffer name-or-buf)
+  (define (ask-if-really-be-killed buf)
+    (if (not 'yes)
+        (quit "Quit")))
+  (let ((buf (get-buffer name-or-buf)))
+    (cond ((and buf (is-readonly? buf))
+           (ask-if-really-be-killed buf)
+           (kill-buffer-function buf))
+          (buf
+           (kill-buffer-function buf))
+          (else #f))))
+
+(define (select-buffer-function pred)
+  (if (circular-find-and-bring-it-top! (buffers-of the-editor) pred)
+      (current-buffer)
+      (quit "No such buffer")))
+
+(define-method select-buffer ((name <string>))
+  (select-buffer-function (lambda (e) (string=? (name-of e) name))))
+
+(define-method select-buffer ((buf <text-buffer>))
+  (select-buffer-function (lambda (e) (eq? e buf))))
+
+(define (switch-to-buffer arg)
+  ;; For now ...
+  (set! (buffers-of the-editor) (cdr (buffers-of the-editor))))
+
+(define (find-buffer-function pred) 
+  (cond ((circular-find (buffer-list) pred) => car)
+        (else #f)))
+
+(define (get-buffer name)
+  (find-buffer-function (lambda (e) (string=? name (name-of e)))))
+
+(define (get-buffer-filename name)
+  (find-buffer-function (lambda (e)
+                          (and (filename-of e)
+                               (string=? name (filename-of e))))))
+
+(define (get-buffer-create name)
+  (let ((buf (get-buffer name)))
+    (if buf buf (make-buffer name))))
+
+;;;
+;;;  FILE
+;;;
+(define (find-file-noselect fname)
+  (if (relative-path? fname)
+      (find-file-noselect (build-path (current-directory) fname))
+      (cond ((get-buffer-filename fname)
+             => (lambda (x) x))
+            
+            ((not (file-exists? fname))
+             (let ((buf (make-buffer (sys-basename fname))))
+               (buffer-set-filename buf fname)
+               buf))
+
+            ((file-is-regular? fname)
+             (let ((buf (make-buffer (sys-basename fname))))
+               (buffer-load-from-file buf fname)
+               buf))
+
+            ((file-is-directory? fname)
+             (let* ((buf (get-buffer-create fname))
+                    (out (open-output-text-buffer buf)))
+               (erase buf)
+               (call-with-input-process (format #f "ls -l ~a" fname)
+                 (lambda (in) 
+                   (copy-port in out)))
+               (close-output-port out)
+               (beginning-of-buffer buf)
+               buf))
+
+            (else
+             (quit "find-file-noselect: something wrong")
+             #f))))
+
+(define (find-file fname)
+  (if (string? fname)
+      (let ((buf (find-file-noselect fname)))
+        (if buf (select-buffer buf)))
+      (let ((fn (read-from-mini-buffer "Find File: " '())))
+        (find-file fn))))
+
+
+(define-command save-buffer (buf n)
+  (cond ((not (filename-of buf))
+         (buffer-flatten-text buf)
+         (message "buffer is not associated with file"))
+        ((not (is-modified? buf))
+         (message "(No changes need to be saved)"))
+        ((= (mtime-of buf) 0)    ; virgin file
+         (buffer-save-to-file buf (filename-of buf)))
+        ((not (buffer-match-mtime? buf))
+         (quit "File has changed on disk"))
+        (else
+         (buffer-save-to-file buf (filename-of buf)))))
+
+(define-command kill-buffer (buf n)
+  (kill-buffer-function buf))
+
+;;;
+;;;  EDIT COMMANDS
+;;;
+(define-command erase (buf)  (buffer-erase buf))
+
+(define-method insert ((buf <text-buffer>) 
+                       (pos <integer>)
+                       (str <string>))
+  (let-syntax ((update! (syntax-rules ()
+                          ((_ loc)
+                           (if (>= loc pos)
+                               (inc! loc (string-length str)))))))
+    (update-buffer buf text-insert pos str)
+    (update! (point-of buf))
+    (update! (mark-of buf))))
+
+(define-method insert ((buf <text-buffer>)
+                       (str <string>))
+  (insert buf (point-of buf) str))
+
+(define-method insert ((buf <text-buffer>) x)
+  (insert buf (x->string x)))
+
+(define-method insert (x)  (insert (current-buffer) x))
+
+(define-method delete ((buf    <text-buffer>)
+                       (pos    <integer>)
+                       (count  <integer>))
+  (let-syntax ((update! (syntax-rules ()
+                          ((_ loc)
+                           (cond ((> loc (+ pos count))
+                                  (dec! loc (+ pos count)))
+                                 ((> loc pos)
+                                  (set! loc pos)))))))
+    (update-buffer buf text-delete pos count)
+    (update! (mark-of buf))
+    (update! (point-of buf))))
+
+(define-command delete (buf count)
+  (delete buf (point-of buf) count))
+
+(define (buffer-delete-region buf from to)
+  (cond ((= from to) #f)
+        ((> from to) 
+         (buffer-delete-region buf to from))
+        (else
+         (delete buf from (- to from)))))
+
+(define-method kill-region ((buf <text-buffer>)
+                            (from <integer>)
+                            (to   <integer>))
+  (let ((str (region->string buf from to)))
+    (buffer-delete-region buf from to)
+    (set! (kill-ring-of the-editor) (list str))))
+
+(define-command kill-region (buf)
+  (kill-region buf (mark-of buf) (point-of buf))
+  (set! (point-of buf) (mark-of buf)))
+
+(define-method copy-region ((buf <text-buffer>)
+                            (from <integer>)
+                            (to   <integer>))
+  (let ((str (region->string buf from to)))
+    (set! (kill-ring-of the-editor) (list str))))
+
+(define-command copy-region (buf)
+  (copy-region buf (mark-of buf) (point-of buf))
+  (message "Region copied"))
+
+(define-command yank (buf n)
+  (insert buf (car (kill-ring-of the-editor))))
+
+(define-command undo (buf n)
+  (dotimes (x n) (buffer-pop-history buf)))
+
+(define-command insert-tab (buf count)
+  (dotimes (x count) (insert "    ")))
+
+(define-command backward-delete (buf count)
+  (let ((pp (point-of buf)))
+    (backward-char buf count)
+    (delete buf (- pp (point-of buf)))))
+
+(define-command beginning-of-line (buf count)
+  (set! (point-of buf) 
+        (text-beginning-of-line (text-of  buf) (point-of buf) count)))
+    
+(define-command end-of-line (buf count)
+  (set! (point-of buf)
+        (text-end-of-line (text-of buf) (point-of buf) count)))
+
+(define (buffer-delete-line buf n proc)
+  (let ((f (point-of buf))
+        (e (text-end-of-line (text-of buf) (point-of buf) n)))
+    (cond ((= f (point-max)) #f)
+          ((= f e)
+           (forward-char)
+           (backward-delete))
+          (else
+           (proc buf f e)))))
+
+(define-command kill-line (buf n)
+  (buffer-delete-line buf n kill-region))
+
+(define-command delete-line (buf n)
+  (buffer-delete-line buf n buffer-delete-region))
+
+(define-command goto-line (buf n)
+  (let* ((e (text-end-of-line (text-of buf) 0 n))
+         (b (text-beginning-of-line (text-of buf) e 1)))
+    (set! (point-of buf) b)))
+
+(define-command beginning-of-buffer (buf n)
+  (set-mark-command buf)
+  (set! (point-of buf) 0))
+
+(define-command end-of-buffer (buf n)
+  (set-mark-command buf)
+  (set! (point-of buf) (text-size (text-of buf))))
+
+(define-command previous-line (buf n)
+  (set! (point-of buf) 
+        (text-previous-line (text-of buf) (point-of buf) n)))
+
+(define-command next-line (buf n)
+  (set! (point-of buf) 
+        (text-next-line (text-of buf) (point-of buf) n)))
+
+(define-command new-line (buf n)
+  (dotimes (x n) 
+    (insert buf "\n")))
+
+(define-command open-line (buf n)
+  (new-line buf n)
+  (backward-char buf n))
+
+(define-command forward-char (buf n)
+  (let ((size (text-size (text-of buf))))
+    (inc! (point-of buf) n)
+    (cond ((< (point-of buf) 0)
+           (set! (point-of buf) 0)
+           (message "Beginning of buffer"))
+          ((< size (point-of buf))
+           (set! (point-of buf) size)
+           (message "End of buffer")))))
+
+(define-command backward-char (buf n) 
+  (forward-char buf (- n)))
+
+(define-command search-forward (buf str)
+  (receive (p txt) 
+      (text-search-forward (text-of buf) (point-of buf) str)
+    (cond ((not p)
+           (message "\"~a\" not found" str) 
+           #f)
+          (else
+           (set! (point-of buf) (+ p (string-length str))) 
+           #t))))
+
+(define-command search-backward (buf str)
+  (receive (p txt) 
+      (text-search-backward (text-of buf) (point-of buf) str)
+    (cond ((not p)
+           (message "\"~a\" not found~%" str)
+           #f)
+          (else
+           (set! (point-of buf) (if (> p 0) p 0))
+           #t))))
+
+(define-command transpose-chars (buf n)
+  (dotimes (x n)
+    (let ((ch (text-get-character (text-of buf) (point-of buf))))
+      (delete buf 1)
+      (backward-char buf 1)
+      (insert ch)
+      (forward-char buf 1))))
+
+;;;
+;;;   LIST BUFFERS
+;;;
+(define (print-buffers)
+  (define (prn buf)
+    (format #t "  ~14,,,14:a ~8d   ~,,,,30:a~%"
+            (if (> (string-length (name-of buf)) 20)
+                (substring (name-of buf) 
+                           (- (string-length (name-of buf)) 20)
+                           (string-length (name-of buf)))
+                (name-of buf))
+            (text-size (text-of buf))
+            (filename-of buf)))
+  (format #t "  ~14,,,14:a ~8@a   ~,,,,30:a~%" "Name" "Size" "File")
+  (circular-for-each prn (buffers-of the-editor)))
+
+(define (list-buffers arg)
+  (let* ((buf  (get-buffer-create "*Buffer List*"))
+         (port (open-output-text-buffer buf)))
+    (erase buf)
+    (with-output-to-port port print-buffers)
+    (close-output-port port)
+    (buffer-flatten-text buf)
+    (select-buffer buf)))
+
+;;;
+;;;   DESCRIBE BINDINGS
+;;;
+(define (describe-bindings arg)
+  (let* ((buf (get-buffer-create "*Help*"))
+         (port (open-output-text-buffer buf)))
+    (erase buf)
+    (with-output-to-port port
+      (lambda () (print-bindings (key-map-of (current-buffer)))))
+    (close-output-port port)
+    (buffer-flatten-text buf)
+    (select-buffer buf)))
+
+;;;
+;;;   DIFF BUFFER
+;;;
+(define-command print-diff (buf n)
+  (define (writer str type)
+    (if type (format #t "~a ~a~%" type str)))
+  (let ((history (find-last-saved-history buf n)))
+    (if history
+        (let ((now  (text->string (text-of buf)))
+              (then (text->string (text-of (car history)))))
+          (format #t "--- ~a" (sys-ctime (mtime-of (car history))))
+          (format #t "+++ ~a" (sys-ctime (last-modified-time-of buf)))
+          (diff-report then now :writer writer)))))
+
+(define-command diff-buffer (buf n)
+  (let* ((outbuf (get-buffer-create "*Diff*"))
+         (port   (open-output-text-buffer outbuf)))
+    (erase outbuf)
+    (with-output-to-port port 
+      (lambda () (print-diff buf n)))
+    (close-output-port port)
+    (buffer-flatten-text outbuf)
+    (select-buffer outbuf)))
+
+;;;
+;;;   EVAL REGION
+;;;
+(define (print-values . vals)
+  (display "=>")
+  (for-each (lambda (x) (display " ") (write/ss x)) vals))
+
+(define (eval-and-print expr)
+  (call-with-values (lambda () (eval expr (interaction-environment)))
+    print-values))
+
+(define-method eval-region ((buf <text-buffer>)
+                            (from <integer>)
+                            (to   <integer>))
+  (define (eval-port)
+    (let lp ((expr (read))
+             (vals '()))
+      (if (eof-object? expr) 
+          vals
+          (lp (read) 
+              (call-with-values 
+                  (lambda () (eval expr (interaction-environment)))
+                list)))))
+  
+  (let ((str (region->string buf from to)))
+    (apply print-values (with-input-from-string str eval-port))))
+        
+(define-method eval-region (x)
+  (eval-region (current-buffer)
+               (mark-of (current-buffer))
+               (point-of (current-buffer))))
+
+(define (eval-buffer x)
+  (eval-region (current-buffer) (point-min) (point-max)))
+
+(define (read-last-sexp text pos count)
+  (if (= count 0) 
+      #f
+      (let ((str (text->string (text-get-text text pos count))))
+        (with-input-from-string str
+          (lambda ()
+            (guard (e ((condition-has-type? e <read-error>)
+                       (read-last-sexp text (+ pos 1) (- count 1))))
+                   (let lp ((v (read)) 
+                            (w #f))
+                     (if (eof-object? v)
+                         w
+                         (lp (read) v)))))))))
+
+(define-command eval-last-sexp (buf)
+  (let ((text (text-of buf)))
+    (cond ((let ((beg (text-beginning-of-line text (point-of buf) 1)))
+             (and beg (read-last-sexp text beg (- (point-of buf) beg))))
+           => eval-and-print)
+          ((let ((beg (text-search-backward text (point-of buf) "\n(")))
+             (and beg (read-last-sexp text beg (- (point-of buf) beg))))
+           => eval-and-print)
+          ((read-last-sexp text 0 (point-of buf))
+           => eval-and-print)
+          (else (message "Could not find sexp")))))
+
+(define-command eval-next-closing-sexp (buf)
+  (let ((save (point-of buf)))
+    (cond ((text-search-backward (text-of buf) (point-of buf) "\n(")
+           => (lambda (p) (set! (point-of buf) p)))
+          (else (set! (point-of buf) 0)))
+    (dynamic-wind 
+        (lambda () #f)
+        (lambda ()
+          (let lp ((expr (with-input-from buf read)))
+            (cond ((>= (point-of buf) save)
+                   (eval-and-print expr))
+                  (else "Could not find sexp"))))
+        (lambda ()
+          (set! (point-of buf) save)))))
+
+;;;
+;;;  SEXP
+;;;
+(define-command insert-and-find-matching-paren (buf)
+
+  (define (show-cursor-for-a-while-at pos)
+    (let ((win (current-window)))
+      (set! (tmp-point-of win) pos)
+      (put-alarm-list! (lambda () (set! (tmp-point-of win) #f)))
+      (sys-alarm 1)))
+      
+  (insert buf #\))
+  (let ((save (point-of buf)))
+    (cond ((text-search-backward (text-of buf) (point-of buf) "\n(")
+           => (lambda (p) (set! (point-of buf) p)))
+          (else (set! (point-of buf) 0)))
+    (dynamic-wind 
+        (lambda () #f)
+        (lambda ()
+          (let lp ((pos (point-of buf))
+                   (str (text->string (text-get-text (text-of buf)
+                                                     (point-of buf)
+                                                     (- save (point-of buf))))))
+            (guard (e ((condition-has-type? e <read-error>)
+                       (lp (+ pos 1)
+                           (substring str 1 (string-length str)))))
+                   (let ((x (with-input-from-string str (lambda () 
+                                                          (read)
+                                                          (peek-char)))))
+                     (cond ((>= pos save)
+                            (error <quit> "unmatched paren"))
+                           ((and (eof-object? x)
+                                 (text-find-character-after (text-of buf) pos #\())
+                            => show-cursor-for-a-while-at)
+                           (else
+                            (lp (+ pos 1)
+                                (substring str 1 (string-length str)))))))))
+        (lambda ()
+          (set! (point-of buf) save)))))
+
+;;;
+;;;  TEXT-WINDOW AND FRAME
+;;;
+(define-class <frame> ()
+  ((minibuf :init-value #f
+            :accessor mini-buffer-of)
+   (windows :init-value '()
+            :accessor windows-of)
+   (window  :init-value #f
+            :accessor current-window-of)
+   (width   :init-value 80
+            :init-keyword :width
+            :accessor width-of)
+   (height  :init-value 25
+            :init-keyword :height
+            :accessor height-of)))
+
+(define-class <text-window> ()
+  ((buffer :init-keyword :buffer
+           :accessor buffer-of)
+   (start  :init-value 0        ;; starting point of buffer for display
+           :init-keyword :start
+           :accessor start-of)
+   (height :init-value 23       ;; number of lines
+           :init-keyword :hight
+           :accessor height-of)
+   (point  :init-value 0        ;; cursor point
+           :accessor point-of)
+   (tmp   :init-value #f        ;; tmp cursor point
+           :accessor tmp-point-of)))
+
+(define-method get-event ((frame <frame>)) #f)
+(define-method event-pending? ((frame <frame>)) #f)
+(define-method get-size  ((frame <frame>)) (values 0 0))
+(define-method display-frame ((frame <frame>)) #f)
+(define-method display-frame () (display-frame (current-frame)))
+(define-method ring-bell  ((frame <frame>) n) #t)
+(define-method ring-bell (n)  (ring-bell (current-frame) n))
+(define-method keyboard-quit ((frame <frame>) n)
+  (ring-bell frame n) (quit "Quit"))
+(define-method keyboard-quit (n) (keyboard-quit (current-frame) n))
+
+(define-method split-window ((frame <frame>))
+  (let* ((win (current-window-of frame))
+         (len (height-of win)))
+    (if (< (quotient len 2) 3)
+        (quit "Current Window is too small"))
+    (let ((new-win (make <text-window>))
+          (new-len (quotient len 2)))
+      (set! (buffer-of new-win) (buffer-of win))
+      (set! (height-of new-win) new-len)
+      (set! (point-of  new-win) (point-of win))
+      (set! (height-of win) (- (height-of win) new-len 1))
+
+      ;; put new-win right befeore win
+      (let lp ((w (windows-of frame))
+               (r '()))
+        (cond ((null? w)
+               (quit "Current window is not belong to the frame"))
+              ((eq? (car w) win)
+               (set! (windows-of frame) 
+                     (append (reverse r) (cons new-win w))))
+              (else (lp (cdr w) (cons (car w) r)))))
+      (set! (current-window-of frame) new-win)
+      new-win)))
+(define-method split-window (x)  (split-window (current-frame)))
+(define-method split-window ()  (split-window (current-frame)))
+
+(define-method delete-window ((frame <frame>)
+                              (win <text-window>))
+  (cond ((<= (length (windows-of frame)) 1)
+         (quit "Can't delete sole window"))
+        ((not (memq win (windows-of frame)))
+         (quit "Window does not belong to the frame")))
+  (select-window win)
+  (inc! (height-of (next-window frame)) (+ 1 (height-of win)))
+  (set! (windows-of frame) (delete! win (windows-of frame) eq?))
+  (if (eq? win (current-window-of frame))
+      (set! (current-window-of frame) (car (windows-of frame)))))
+(define-method delete-window ((frame <frame>))
+  (delete-window frame (current-window)))
+(define-method delete-window ((win <text-window>))
+  (delete-window (current-frame) win))
+(define-method delete-window (x)
+  (delete-window (current-frame) (current-window)))
+(define-method delete-window ()
+  (delete-window (current-frame) (current-window)))
+(define (delete-other-window x)
+  (delete-window (current-frame) (next-window)))
+
+(define-method select-window ((frame <frame>) (win <text-window>))
+  (cond ((not (memq win (windows-of frame)))
+         (quit "Window does not belong to the frame"))
+        ((not (follow-cursor? (buffer-of win)))
+         (set! (point-of (buffer-of win)) (point-of win))))
+  (set! (current-window-of frame) win))
+(define-method select-window ((win <text-window>))
+  (select-window (current-frame) win))
+
+(define-method next-window ((frame <frame>))
+  (let ((w (memq (current-window) (windows-of frame))))
+    (cond ((and w (null? (cdr w)))
+           (car (windows-of frame)))
+          (w (cadr w)))))
+(define-method next-window () (next-window (current-frame)))
+
+(define (other-window . n) (select-window (next-window)))
+
+;;;
+;;;  WINDOW
+;;;
+(define-method recenter ((win <text-window>) _)
+  (let* ((len   (height-of win))
+         (buf   (buffer-of win))
+         (lino  (line-number-of (buffer-of win)))
+         (new   (- lino (quotient len 2)))
+         (new-pos (text-end-of-line (text-of buf) 0 new))
+         (new-pos (text-beginning-of-line (text-of buf) new-pos 1)))
+    (if (> new 1)
+        (set! (start-of win) new-pos)
+        (set! (start-of win) 0))))
+
+(define (recenter-window _)
+  (recenter (current-window) _))
+
+(define-method scroll-up ((win <text-window>) n)
+  (let* ((buf     (buffer-of win))
+         (sln     (text-line-number (text-of buf) (start-of win)))
+         (hlen    (quotient (height-of win) 2))
+         (nol     (number-of-lines-of (buffer-of win)))
+         (newln   (+  sln (* hlen n))))
+    (if (<= newln  (- nol hlen))
+        (let* ((new-pos (text-end-of-line (text-of buf) 0 newln))
+               (new-pos (text-beginning-of-line (text-of buf) new-pos 1)))
+          (set! (start-of win) new-pos)
+          (goto-line buf newln))
+        (message "End of buffer"))))
+
+(define-method scroll-up (n) (scroll-up (current-window) n))
+
+(define-method scroll-down ((win <text-window>) n)
+  (let* ((buf   (buffer-of win))
+         (sln   (text-line-number (text-of buf) (start-of win)))
+         (hlen  (quotient (height-of win) 2))
+         (nol   (number-of-lines-of (buffer-of win)))
+         (newln   (- sln (* hlen n))))
+    (if (>= newln 1)
+        (let* ((new-pos (text-end-of-line (text-of buf) 0 newln))
+               (new-pos (text-beginning-of-line (text-of buf) new-pos 1)))
+          (set! (start-of win) new-pos)
+          (goto-line buf newln))
+        (message "Beginning of buffer"))))
+
+(define-method scroll-down (arg) (scroll-down (current-window) arg))
+
+;;;;
+;;;;   KEY MAP (EVENT MAP?)
+;;;;
+(define (make-key-map)               (make-hash-table))
+(define (key-map-put! kmap key obj)  (hash-table-put! kmap key obj))
+(define (key-map-get kmap key)       (hash-table-get  kmap key #f))
+(define (key-map? obj)               (hash-table? obj))
+(define (key-map-for-each proc kmap) (hash-table-for-each kmap proc))
+(define (key-map-map proc kmap)      (hash-table-map kmap proc))
+
+(define (key-map->list kmap)
+  (key-map-map (lambda (key obj)
+                 (if (key-map? obj)
+                     (list key (key-map->list obj))
+                     (list key obj)))
+               kmap))
+
+(define (list->key-map lis)
+  (let ((kmap (make-key-map)))
+    (for-each (lambda (elm)
+                (let ((key (list-ref elm 0))
+                      (obj (list-ref elm 1)))
+                  (if (pair? obj)
+                      (key-map-put! kmap key (list->key-map obj))
+                      (key-map-put! kmap key obj))))
+              lis)
+    kmap))
+
+(define (copy-key-map kmap)
+  (list->key-map (key-map->list kmap)))
+
+(define (char->control-code ch)
+  (case ch ((#\@) 0)  ((#\\) 28)  
+           ((#\]) 29) ((#\/) 127)
+    (else
+     (- (char->integer ch)
+        (char->integer #\a)
+        -1))))
+
+(define (control-code->char int)
+  (case int ((0)   #\@) ((28)  #\\)
+            ((29)  #\]) ((127) #\/)
+    (else
+     (integer->char (+ int (char->integer #\a) -1)))))
+
+(define (key-stack->string stack)
+  (with-output-to-string 
+    (lambda ()
+      (for-each (lambda (x)
+                  (cond ((= x 27)
+                         (display "M-"))
+                        ((< x 31)
+                         (display "C-")
+                         (display (control-code->char x))
+                         (display " "))
+                        (else 
+                         (display (integer->char x))
+                         (display " "))))
+                (reverse stack)))))
+
+(define (list->key-spec lis)
+  (with-output-to-string 
+    (lambda ()
+      (for-each (lambda (x)
+                  (cond ((= x 27)
+                         (display "\\M-"))
+                        ((< x 31)
+                         (display "\\C-")
+                         (display (control-code->char x)))
+                        (else 
+                         (display (integer->char x)))))
+                lis))))
+
+(define (key-spec->list spec)
+
+  (define (handle-modifier ch lis)
+    (cond ((char=? ch #\C)
+           (read-char)                  ; #\-
+           (let ((x (read-char)))
+             (read-spec (read-char)
+                        (cons (char->control-code x)
+                              lis))))
+          ((char=? ch #\M)
+           (read-char)                  ; #\-
+           (let ((x (read-char)))
+             (read-spec (read-char) 
+                        (cons (char->integer x)
+                              (cons 27 lis))))) ;; ESC=27 
+          (else
+           (quit "unknown modifier"))))
+
+  (define (read-spec ch lis)
+    (cond ((eof-object? ch)  (reverse lis))
+          ((char=? ch #\\)
+           (handle-modifier (read-char) lis))
+          (else
+           (read-spec (read-char) 
+                      (cons (char->integer ch)
+                            lis)))))
+
+  (with-input-from-string spec 
+    (lambda () (read-spec (read-char) '()))))
+
+(define (define-key kmap spec cmd)
+  (let lp ((stack (key-spec->list spec))
+           (kmap kmap))
+    (cond ((null? stack) #f)
+          ((null? (cdr stack))
+           (key-map-put! kmap (car stack) cmd))
+          ((key-map? (key-map-get kmap (car stack)))
+           (lp (cdr stack)  
+               (key-map-get kmap (car stack))))
+          (else
+           (let ((nkmap (make-key-map)))
+             (key-map-put! kmap (car stack) nkmap)
+             (lp (cdr stack) nkmap))))))
+
+(define (global-set-key spec cmd)
+  (define-key (global-key-map-of the-editor) spec cmd)
+  (for-each (lambda (buf)
+              (define-key (key-map-of buf) spec cmd))
+            (buffers-of the-editor)))
+
+(define (key-map-cmpfn a b) (< (car a) (car b)))
+
+(define (print-bindings kmap)
+  (let ((lis (key-map->list kmap)))
+    (print-bindings-list (sort lis key-map-cmpfn) '())))
+
+(define (print-bindings-list lis stack)
+  (for-each (lambda (elm)
+              (let ((key (list-ref elm 0))
+                    (obj (list-ref elm 1)))
+                (cond ((pair? obj)
+                       (print-bindings-list (sort obj key-map-cmpfn) 
+                                            (cons key stack)))
+                      ((procedure? obj)
+                       (format #t "~10a ~a~%"
+                               (key-stack->string (cons key stack))
+                               (procedure-info obj)))
+                      (else
+                       (format #t "~10a ~a~%"
+                               (key-stack->string (cons key stack))
+                               obj)))))
+            lis))
+
+;;;
+;;;   MINI BUFFER
+;;;
+(define-class <mini-buffer> (<text-buffer>)
+  ((prompt :init-value ""
+           :init-keyword :prompt
+           :accessor prompt-of)
+   ))
+
+(define (make-mini-buffer frame prompt kmap)
+  (let ((minibuf (make <mini-buffer> 
+                   :name (make-unique-buffer-name " *Mini-Buffer*")
+                   :key-map (copy-key-map kmap)
+                   :prompt prompt)))
+    (circular-append! (buffers-of the-editor) minibuf)
+    (set! (mini-buffer-of frame) minibuf)
+    minibuf))
+
+(define (kill-mini-buffer frame)
+  (cond ((mini-buffer-of frame)
+         => (lambda (minibuf)
+              (set! (prompt-of minibuf) "")
+              (reinitialize-buffer minibuf)
+              (remove-buffer-from-the-editor minibuf)
+              (set! (mini-buffer-of frame) #f)))
+        (else (quit "No mini-buffer to kill"))))
+
+(define (make-exit-from-mini-buffer frame minibuf curbuf k)
+  (lambda _
+    (cond ((eq? minibuf (mini-buffer-of frame))
+           (let ((str (text->string (text-of minibuf))))
+             ;;(kill-mini-buffer frame)
+             ;;(select-buffer curbuf)
+             (k str)))
+          (else 
+           (error "exit-from-mini-buffer")))))
+
+(define-method read-from-mini-buffer ((frame  <frame>)
+                                      (prompt <string>)
+                                      (kmap   <hash-table>)
+                                      hist)
+  (call/cc (lambda (k)
+             (let* ((curbuf  (current-buffer))
+                    (minibuf (make-mini-buffer frame prompt kmap))
+                    (efmb    (make-exit-from-mini-buffer frame minibuf 
+                                                         curbuf k)))
+
+               (define-key (key-map-of minibuf) "\\C-m" efmb)
+               (select-buffer minibuf)
+               (dynamic-wind
+                   (lambda () #f)
+                   interactive-loop0
+                   (lambda ()
+                     (kill-mini-buffer frame)
+                     (select-buffer curbuf)))))))
+
+(define-method read-from-mini-buffer ((prompt <string>)
+                                      hist)
+  (read-from-mini-buffer (current-frame) 
+                         prompt 
+                         (default-mini-buffer-key-map-of the-editor)
+                         hist))
+
+(define (test-mini-buffer . _)
+  (let ((str (read-from-mini-buffer "TEST: " '())))
+    (format #t "test-mini-buffer: ~s~%" str)))
+
+;;;
+;;;   COMMAND LOOP
+;;;
+(define (universal-argument n)
+  (interactive-loop1 (+ n 4) (key-map-of (current-buffer)) '()))
+
+(define (interactive-loop0)
+  (let loop ((kmap (key-map-of (current-buffer))))
+    (update-display)
+    (interactive-loop1 1 kmap '())
+    (loop (key-map-of (current-buffer)))))
+
+(define-class <event> ()
+  ((kind  :init-value #f
+          :accessor kind-of
+          :init-keyword :kind)))
+
+(define-class <key-event> (<event>)
+  ((frame :init-value #f
+          :accessor frame-of
+          :init-keyword :frame)
+   (key   :init-value #f
+          :accessor key-of
+          :init-keyword :key)))
+
+(define (get-key-event)
+  (let lp ((f (frames-of the-editor)))
+    (cond ((null? f) #f)
+          ((event-pending? (car f))
+           (make <key-event> :kind 'key :frame (car f) :key (get-event (car f))))
+          (else
+           (lp (cdr f))))))
+
+(define (get-timer-event) #f)
+
+(define (wait-for-event)
+  (cond ((get-key-event) => values)
+        ((get-timer-event) => values)
+        (else
+         ;;; !!!
+         (make <key-event> :kind 'key :frame (car (frames-of the-editor))
+               :key (get-event (car (frames-of the-editor)))))))
+
+(define (interactive-loop1 arg kmap stack)
+
+  (define (unbound-error stack)
+    (errorf <quit> "~a is not defined" (key-stack->string stack)))
+
+  (let* ((e     (wait-for-event))
+         (frame (frame-of e))
+         (key   (key-of e))
+         (obj   (key-map-get kmap key)))
+    (cond ((key-map? obj)
+           (interactive-loop1 arg obj (cons key stack)))
+          ((symbol? obj)
+           (message "~a: not implemented yet" obj))
+          ((eq? key 7) 
+           (erase-echo-area frame)
+           (keyboard-quit frame 1))
+          ((not obj)
+           (erase-echo-area frame)
+           (if (null? stack)
+               (insert (integer->char key))
+               (unbound-error (cons key stack))))
+          ((eq? (procedure-info obj) 'no-such-command)
+           (erase-echo-area frame)
+           (unbound-error (cons key stack)))
+          (else
+           (erase-echo-area frame)
+           (obj arg)))))
+
+(define (erase-echo-area frame)
+  (let* ((buf (get-buffer "*Messages*"))
+         (text (text-of buf))
+         (end  (text-size text))
+         (beg  (text-beginning-of-line text end 1)))
+    (if (not (= beg end))
+        (insert buf end "\n"))))
+
+(define (update-display)
+  (sync-buffers-and-windows)
+  (display-frame))
+
+(define (interactive-loop)
+
+  (define (handle-error c)
+    (format (current-error-port)
+            "*** ERROR: ~a"
+            (slot-ref c 'message))
+    (report-error c)
+    (interactive-loop))
+
+  (define (handle-quit c)
+    (display (slot-ref c 'message))
+    (interactive-loop))
+
+  (guard (c ((<error> c) (handle-error c))
+	    ((<quit>  c) (handle-quit  c)))
+	 (interactive-loop0)))
+
+(define sync-current-buffer-and-window
+  (let ((prev-buf #f)
+        (prev-win #f))
+    (lambda ()
+      (cond ((mini-buffer-of (current-frame)) #t)
+            ((and prev-win prev-buf)
+             (if (not (eq? prev-win (current-window)))
+                 (select-buffer (buffer-of (current-window))))
+             (if (not (eq? prev-buf (current-buffer)))
+                 (set! (buffer-of (current-window)) (current-buffer)))
+             (set! (point-of (current-window)) (point-of (current-buffer)))
+             (set! prev-buf  (current-buffer))
+             (set! prev-win  (current-window)))
+            (else
+             (set! prev-buf  (current-buffer))
+             (set! prev-win  (current-window)))))))
+
+(define (sync-buffers-and-windows)
+  (sync-current-buffer-and-window))
+
+;;;
+;;;  EDITOR
+;;;
+(define-class <editor> ()
+  ((kmap   :init-thunk make-key-map
+           :accessor global-key-map-of)
+   (mbmap  :init-thunk make-key-map
+           :accessor default-mini-buffer-key-map-of)
+   (buffs  :init-value '()
+           :accessor buffers-of)
+   (frames :init-value '()
+           :accessor frames-of)
+   (kring  :init-value '()
+            :accessor kill-ring-of)
+   (alarm-list :init-value '()
+               :accessor alarm-list-of)))
+
+(define (put-alarm-list! thunk)
+  (push! (alarm-list-of the-editor) thunk))
+
+(define (exit-editor editor)
+  (for-each delete-frame (frames-of editor))
+  (exit 0))
+
+(define (message . args)
+  ;; Is it better to move to the end of buffer?
+  (apply format (cons (current-error-port) args)))
+
+(define the-editor       #f)
+(define (buffer-list)    (buffers-of the-editor))
+(define (current-buffer) (car (buffer-list)))
+(define (current-frame)  (car (frames-of the-editor)))
+(define (current-window) (current-window-of (current-frame)))
+
+(define (no-such-command . _) #f)
+(define (stay-quiet . _) #t)
+
+(define (initialize-key-map editor)
+  (initialize-global-key-map editor)
+  (initialize-default-mini-buffer-key-map editor))
+
+(define (initialize-default-mini-buffer-key-map editor)
+  (let ((kmap (default-mini-buffer-key-map-of editor)))
+    (define-key kmap "\\C-@"  set-mark-command)
+    (define-key kmap "\\C-a"  beginning-of-line)
+    (define-key kmap "\\C-b"  backward-char)
+    (define-key kmap "\\C-c"  no-such-command)
+    (define-key kmap "\\C-d"  delete)
+    (define-key kmap "\\C-e"  end-of-line)
+    (define-key kmap "\\C-f"  forward-char)
+    (define-key kmap "\\C-g"  keyboard-quit)
+    (define-key kmap "\\C-h"  backward-delete)
+    (define-key kmap "\\C-/"  backward-delete) ; DEL
+    (define-key kmap "\\C-i"  stay-quiet)      ; mini-buffer-completion
+    (define-key kmap "\\C-j"  stay-quiet)
+    (define-key kmap "\\C-k"  kill-line)
+    (define-key kmap "\\C-l"  no-such-command)
+    (define-key kmap "\\C-m"  no-such-command)
+    (define-key kmap "\\C-n" 'mini-buffer-next-history)
+    (define-key kmap "\\C-o"  no-such-command)
+    (define-key kmap "\\C-p" 'mini-buffer-previous-history)
+    (define-key kmap "\\C-q"  no-such-command)
+    (define-key kmap "\\C-r"  no-such-command)
+    (define-key kmap "\\C-s"  no-such-command)
+    (define-key kmap "\\C-t"  transpose-chars)
+    (define-key kmap "\\C-u"  no-such-command)
+    (define-key kmap "\\C-v"  no-such-command)
+    (define-key kmap "\\C-w"  kill-region)
+
+    (define-key kmap "\\C-x\\C-c" exit-guide)
+
+    (define-key kmap "\\C-y"  yank)
+    (define-key kmap "\\C-z"  no-such-command)
+    
+    ))
+
+(define (initialize-global-key-map editor)
+  (let ((kmap (global-key-map-of editor)))
+    (define-key kmap ")" insert-and-find-matching-paren)
+    (define-key kmap "\\C-@"  set-mark-command)
+    (define-key kmap "\\C-a"  beginning-of-line)
+    (define-key kmap "\\C-b"  backward-char)
+    (define-key kmap "\\C-d"  delete)
+    (define-key kmap "\\C-e"  end-of-line)
+    (define-key kmap "\\C-f"  forward-char)
+    (define-key kmap "\\C-g"  keyboard-quit)
+    (define-key kmap "\\C-h"  backward-delete)
+    (define-key kmap "\\C-/"  backward-delete) ; DEL
+    (define-key kmap "\\C-i"  insert-tab)
+    (define-key kmap "\\C-j"  eval-last-sexp)
+    (define-key kmap "\\C-k"  kill-line)
+    (define-key kmap "\\C-l"  recenter-window)
+    (define-key kmap "\\C-m"  new-line)
+    (define-key kmap "\\C-n"  next-line)
+    (define-key kmap "\\C-o"  open-line)
+    (define-key kmap "\\C-p"  previous-line)
+    (define-key kmap "\\C-q"  no-such-command)
+    (define-key kmap "\\C-r"  no-such-command)
+    (define-key kmap "\\C-s"  no-such-command)
+    (define-key kmap "\\C-t"  transpose-chars)
+    (define-key kmap "\\C-u"  universal-argument)
+    (define-key kmap "\\C-v"  scroll-up)
+    (define-key kmap "\\C-w"  kill-region)
+    (define-key kmap "\\C-y"  yank)
+    (define-key kmap "\\C-z"  no-such-command)
+    (define-key kmap "\\M-v"  scroll-down)
+    (define-key kmap "\\M-w"  copy-region)
+    (define-key kmap "\\M-x"  no-such-command)
+    (define-key kmap "\\M->"  end-of-buffer)
+    (define-key kmap "\\M-<"  beginning-of-buffer)
+    (define-key kmap "\\C-\\" no-such-command)
+    (define-key kmap "\\C-]"  no-such-command)
+
+    (define-key kmap "\\C-c\\C-c" eval-buffer)
+    (define-key kmap "\\C-c\\C-r" eval-region)
+    (define-key kmap "\\C-c\\C-m" eval-next-closing-sexp)
+    (define-key kmap "\\C-ct" test-mini-buffer)
+
+    (define-key kmap "\\C-xb" switch-to-buffer)
+    (define-key kmap "\\C-xd" describe-bindings)
+    (define-key kmap "\\C-xk" kill-buffer)
+    (define-key kmap "\\C-xo" other-window)
+    (define-key kmap "\\C-x0" delete-window)
+    (define-key kmap "\\C-x1" delete-other-window)
+    (define-key kmap "\\C-x2" split-window)
+    (define-key kmap "\\C-xu" undo)
+    (define-key kmap "\\C-x\\C-b" list-buffers)
+    (define-key kmap "\\C-x\\C-c" exit-guide)
+    (define-key kmap "\\C-x\\C-d" diff-buffer)
+    (define-key kmap "\\C-x\\C-e" eval-last-sexp)
+    (define-key kmap "\\C-x\\C-f" find-file)
+    (define-key kmap "\\C-x\\C-s" save-buffer)
+    (define-key kmap "\\C-x\\C-x" exchange-point-and-mark)
+    ))
+
+(define (exit-guide arg) (exit-editor the-editor))
+
+(define (make-empty-frame frame-class)
+  (let ((frame (make frame-class)))
+    (receive (w h) (get-size frame)
+      (set! (width-of frame)  w)
+      (set! (height-of frame) h))
+    frame))
+  
+(define-method add-frame ((editor <editor>)
+                          (frame-class <class>))
+  (let ((frame  (make-empty-frame frame-class))
+        (window (make <text-window>)))
+
+    (set! (windows-of frame) (list window))
+    (set! (current-window-of frame) window)
+
+    (set! (buffer-of window) (car (buffers-of editor)))
+    (set! (height-of window) (- (height-of frame) 3))
+
+    (push! (frames-of editor) frame)))
+
+(define (make-editor)
+  (let ((editor (make <editor>))
+        (msgbuf (make <text-buffer> :name "*Messages*")))
+    
+    (initialize-key-map editor)
+    (set! (key-map-of msgbuf) (copy-key-map (global-key-map-of editor)))
+
+    (buffer-let-window-always-follow-point msgbuf)
+    (buffer-make-persistent msgbuf)
+    (set! (buffers-of editor) (circular-list msgbuf))
+
+    editor))
+
+;;;
+;;;  INIT MAIN
+;;;
+(define (initialize-the-editor)
+  (set! the-editor (make-editor))
+  (add-frame the-editor <vt100-frame>)
+  (sync-buffers-and-windows)
+  (let ((schbuf (make-buffer "*scratch*")))
+    (select-buffer schbuf)))
+
+(define (main args)
+  (sys-system "stty min 1 time 0")  ; SunOS 5.8
+  (with-raw-mode  (lambda () (apply run (cdr args))))
+  ;; Do we need to restore min and time above?
+  )
+
+(if debug?
+    (define (with-output-and-error-to-port port thunk) (thunk))
+    (define (with-output-and-error-to-port port thunk)
+      (with-error-to-port port (lambda () (with-output-to-port port thunk))))
+)
+
+(define (alarm-handler x)
+  (for-each (lambda (x) (x)) (alarm-list-of the-editor))
+  (set! (alarm-list-of the-editor) '())
+  (update-display))
+
+(define (run . args)
+  (initialize-the-editor)
+  (sync-buffers-and-windows)
+  (set-signal-handler! SIGWINCH vt100-sigwinch-handler)
+  (set-signal-handler! SIGALRM alarm-handler)
+  (let ((errp (open-output-text-buffer (get-buffer "*Messages*"))))
+    (with-output-and-error-to-port errp 
+                                   (lambda () 
+                                     (for-each find-file args)
+                                     (interactive-loop)))))
+
+;;;
+;;;  VT100 FRAME :-)
+;;;
+(define-class <vt100-frame> (<frame>)
+  ((input-port  :init-thunk standard-input-port
+                :accessor input-port-of)
+   (output-port :init-thunk standard-output-port
+                :accessor output-port-of)))
+
+(define-method delete-frame ((frame <vt100-frame>))
+  (with-output-to-port (output-port-of frame)
+    (lambda ()
+      (vt100-cursor-position 1 (height-of frame))
+      (vt100-show-cursor))))
+
+(define (vt100-sigwinch-handler sig)
+  (receive (x y) (vt100-get-size)
+    (let* ((win    (car (windows-of (current-frame))))
+           (height (height-of (current-frame)))
+           (newh   (+ (height-of win) (- y height))))
+      (cond ((and (= x (width-of  (current-frame)))
+                  (= y (height-of (current-frame)))) #t)
+            ((> newh 4)
+             (set! (width-of  (current-frame)) x)
+             (set! (height-of (current-frame)) y)
+             (set! (height-of win) newh)
+             (display-frame))
+            (else
+             (error "Terminal height too short!!!"))))))
+
+(define (print-text text from to)
+  (for-each display (text-get-text text from (- to from))))
+
+(define-method ring-bell ((frame <vt100-frame>) n)
+  (dotimes (x n) (write-byte 7 (output-port-of frame))))
+
+(define-method get-size ((frame <vt100-frame>)) (vt100-get-size))
+
+(define-method get-event ((frame <vt100-frame>))
+
+  (define (read-utf-8-macosx-terminal)
+
+    ;; In MacOSX each UTF-8 byte is preambled by SYN(0x16)
+    (define (read-one) (read-byte) (read-byte))
+
+    (let ((x1 (read-byte))
+          (x2 (read-one)))
+      (cond ((= #b110 (bit-field x1 5 8))
+             (+ (* (logand x1 #b00011111) 64)
+                (* (logand x2 #b00111111) 1)))
+            ((= #b1110 (bit-field x1 4 8))
+             (let ((x3 (read-one)))
+               (+ (* (logand x1 #b00011111) 64 64)
+                  (* (logand x2 #b00111111) 64)
+                  (* (logand x3 #b00111111) 1))))
+            ((= #b11110 (bit-field x1 3 8))
+             (let ((x3 (read-one))
+                   (x4 (read-one)))
+               (+ (* (logand x1 #b00011111) 64 64 64)
+                  (* (logand x2 #b00111111) 64 64)
+                  (* (logand x3 #b00111111) 64)
+                  (* (logand x4 #b00111111) 1))))
+            ((= #b111110 (bit-field x1 2 8))
+             (let ((x3 (read-one))
+                   (x4 (read-one))
+                   (x5 (read-one)))
+               (+ (* (logand x1 #b00011111) 64 64 64 64)
+                  (* (logand x2 #b00111111) 64 64 64)
+                  (* (logand x3 #b00111111) 64 64)
+                  (* (logand x4 #b00111111) 64)
+                  (* (logand x5 #b00111111) 1))))
+            ((= #b111110 (bit-field x1 2 8))
+             (let ((x3 (read-one))
+                   (x4 (read-one))
+                   (x5 (read-one))
+                   (x6 (read-one)))
+               (+ (* (logand x1 #b00011111) 64 64 64 64 64)
+                  (* (logand x2 #b00111111) 64 64 64 64)
+                  (* (logand x3 #b00111111) 64 64 64)
+                  (* (logand x4 #b00111111) 64 64)
+                  (* (logand x5 #b00111111) 64)
+                  (* (logand x6 #b00111111) 1))))
+            (else
+             (error "in get-event")))))
+
+  (with-input-from-port (input-port-of frame)
+    (lambda ()
+      (if (= (peek-byte) 22)
+          (begin
+            (read-byte)
+            (if (or (not (char-ready? (current-input-port)))
+                    (= (logand #x80 (peek-byte)) 0))
+                22
+                (read-utf-8-macosx-terminal)))
+          (read-byte)))))
+
+(define-method event-pending? ((frame <vt100-frame>))
+  (char-ready? (input-port-of frame)))
+
+(define-method display-frame ((frame <vt100-frame>))
+
+  (define (display-the-last-line buf)
+    (let* ((text (text-of buf))
+           (to   (text-size text))
+           (from (text-beginning-of-line text to 1)))
+      (print-text text from to)))
+
+  (define (display-mini-buffer buf)
+    (display (prompt-of buf))
+    (display-the-last-line buf))
+
+  (define (display-echo-area)
+    (cond ((mini-buffer-of frame) => display-mini-buffer)
+          ((get-buffer "*Messages*") => display-the-last-line)))
+
+  (define (display-window win)
+
+    (define (display-mode-line buf cx cy)
+      (let* ((text (text-of buf))
+             (name (name-of buf))
+             (pos  (point-of buf))
+             (cln  (text-line-number text pos))
+             (segs (length text)))
+        (vt100-reverse-video)
+        (let ((str (format #f "-~a ~,,,,30a  L~d P~d S~d (~d,~d)" 
+                           (cond ((is-modified? buf) #\*)
+                                 ((is-readonly? buf) #\%)
+                                 (else #\-))
+                           name cln pos segs cx cy)))
+          (display str)
+          (display (make-string (- (width-of frame)
+                                   (string-length str)) #\-))
+          (newline))
+        (vt100-normal-video)))
+
+    (let* ((buf  (buffer-of win))
+           (text (text-of buf))
+           (pos  (cond ((tmp-point-of win)
+                        (tmp-point-of win))
+                       ((follow-cursor? buf)
+                        (point-of buf))
+                       (else
+                        (point-of win))))
+           (cln  (text-line-number text pos))
+           (rln  (text-number-of-lines text pos))
+           (tln  (+ cln rln -1))
+           (start-pos (start-of win))
+           (start-ln  (text-line-number text start-pos)))
+
+      (if (<= tln (height-of win)) 
+          (set! (start-of win) 0))
+
+      (if (< cln start-ln)
+          (set! (start-of win) (text-beginning-of-line text pos 1)))
+
+      (if (>= cln (+ start-ln (height-of win)))
+          (set! (start-of win) (+ 1 (text-end-of-line text 
+                                                      0
+                                                      (- cln 
+                                                         (height-of win))))))
+      (receive (w h cx cy)
+          (display-text (text-get-text (text-of buf)
+                                       (start-of win) -1)
+                        (- pos (start-of win))
+                        (width-of frame)
+                        (height-of win))
+        (dotimes (x h) (newline))
+        (display-mode-line buf cx cy)
+        (values cx cy))))
+
+  (display (with-output-to-string
+             (lambda ()
+               (let ((x 0) (y 0)
+                     (current-window-found? #f))
+                 (vt100-hide-cursor)
+                 (vt100-clear-screen)
+                 (for-each (lambda (win)
+                             (receive (cx cy) (display-window win)
+                               (if (eq? win (current-window))
+                                   (begin
+                                     (set! current-window-found? #t)
+                                     (set! x cx)
+                                     (set! y (+ y cy))))
+                               (if (not current-window-found?)
+                                   (set! y (+ y (height-of win) 1)))))
+                           (windows-of frame))
+                 (display-echo-area)
+                 (if (mini-buffer-of frame)
+                     (vt100-move-cursor-to-echo frame)
+                     (vt100-cursor-position x y))
+                 (vt100-show-cursor)
+                 (flush))))
+           (output-port-of frame)))
+
+(define (vt100-clear-screen)  (display "\x1b[H\x1b[2J"))
+(define (vt100-hide-cursor)   (display "\x1b[?25l"))
+(define (vt100-show-cursor)   (display "\x1b[?25h"))
+(define (vt100-reverse-video) (display "\x1b[7m"))
+(define (vt100-normal-video)  (display "\x1b[0m"))
+(define (vt100-cursor-position x y) (format #t "\x1b\x5b~d;~dH" y x))
+
+(define (vt100-cursor-position1 x y)
+  (format #t "\x1b[~d;0H" y)
+  (if (not (= x 0))
+      (format #t "\x1b[~dC" x)))
+
+
+(define (vt100-get-size)
+  ;; "VAR=VAL;"
+  (define (get-val str)
+    (let ((x (cadr (string-split str #\=))))
+      (string->number (substring x 0 (- (string-length x) 1)))))
+  (with-input-from-process "resize -u"
+    (lambda ()
+      (let ((x (get-val (read-line)))
+            (y (get-val (read-line))))
+        (values x y)))))
+
+(define (vt100-move-cursor-to-echo frame)
+  (let ((minibuf (mini-buffer-of frame)))
+    (vt100-cursor-position (+ (string-length (prompt-of minibuf))
+                              (point-of minibuf) 1)
+                           (- (height-of frame) 1))))
+
+(define (vt100-char-width ch)
+  (cond ((number? ch) 0)
+        ((< (char->ucs ch) 32) 0)
+        ((< (char->ucs ch) 256) 1)
+        (else 2)))
+
+(define (vt100-string-width str idx)
+  (let loop ((i     0)
+             (width 0))
+    (if (>= i idx)
+        width
+        (loop (+ i 1) 
+              (+ width (vt100-char-width (string-ref str i 0)))))))
+
+(define (vt100-string-index-by-width str width)
+  (let ((len (string-length str)))
+    (let loop ((i 0)
+               (width width))
+      (cond ((>= i len) len)
+            ((= width 0) i)
+            ((< width 0) (- i 1))
+            (else
+             (loop (+ i 1)
+                   (- width 
+                      (vt100-char-width (string-ref str i 0)))))))))
+;;;
+;;;
+;;;
+(define (display-text text pos width height)
+  (let loop ((text text)
+             (pos pos)
+             (wc  0)
+             (w   width)
+             (h   height)
+             (x   1)
+             (y   1))
+    (cond ((null? text) (values w h x y))
+          ((<= h 0)     (values w 0 x y))
+          (else
+           (receive (pos wc w h x y) 
+               (display-string (car text) pos wc w h x y width)
+             (loop (cdr text) pos wc w h x y))))))
+
+(define (display-text-n text pos width height)
+  (let loop ((text text)
+             (p pos)
+             (x 0)
+             (y 0)
+             (h height))
+    (receive (idx next) (text-find-character-after text pos #\newline)
+      (if idx 
+          (receive (p x y h)
+              (display-line (text->string (text-get-text text 0 idx))
+                            p width h x y)
+            (loop next p x y h))
+          (receive (p x y h)
+              (display-line (text->string (text-get-text text 0 next))
+                            p width h x y)
+            (values p x y h))))))
+
+(define (display-line str pos width height x y)
+  (let ((len (string-length str))
+        (idx (vt100-string-index-by-width str width)))
+    (cond ((<= height 0) (values pos x y 0))
+          ((zero? idx)   (values pos x y height))
+          ((= idx len)
+           (display str)
+           (values (- pos len) 
+                   (if (>= pos 0) pos x)
+                   y
+                   height))
+          (else
+           (display (substring str 0 (- idx 1)))
+           (display "\\\n")
+           (display-line (substring str (- idx 1) len)
+                         (- pos idx -1)
+                         width
+                         (- height 1)
+                         (if (>= pos 0) pos x)
+                         (if (>= (- pos idx -1) 0)
+                             (+ y 1)
+                             y))))))
+
+#|
+(begin (newline)
+       (receive x (display-line "01234567890123456789012" 22 11 2 0 0)
+         (newline)
+         (print x)))
+|#
+
+
+(define (display-string str pos wc w h x y full-width)
+
+  (define (trim-display str)
+    (let ((idx (vt100-string-index-by-width str (if (> w 3) (- w 3) 0))))
+      (display (substring str 0 idx))
+      (display "$")
+      (values (- pos (string-length str))
+              0
+              full-width
+              h
+              (if (>= pos 0)
+                  (+ wc pos 1)
+                  x)
+              y)))
+
+  (define (fold-display str)
+    (let ((idx (vt100-string-index-by-width str (- w 1))))
+      (cond ((> idx 0)
+             (display (substring str 0 (- idx 1)))
+             (display "\\\n")
+             (display-string (substring str (- idx 1) 
+                                        (string-length str))
+                             (- pos idx -1)
+                             0
+                             full-width
+                             (- h 1)
+                             (if (>= pos 0)
+                                 (+ wc pos 1)
+                                 x)
+                             (if (>= (- pos idx -1) 0)
+                                 (+ y 1)
+                                 y)
+                             full-width))
+            (else
+             (display "\\\n")
+             (display-string str pos 0 
+                             full-width
+                             (- h 1)
+                             (if (>= pos 0)
+                                 (+ wc pos 1)
+                                 x)
+                             (if (>= (- pos idx -1) 0)
+                                 (+ y 1)
+                                 y)
+                             full-width)))))
+
+
+  (define (display-line str)
+    (let ((dispw (vt100-string-width str w))
+          (len   (string-length str)))
+      (cond ((<= dispw w)
+             (display str)
+             (values (- pos len)
+                     (+ wc len)
+                     (- w dispw)
+                     h
+                     (if (>= pos 0)
+                         (+ wc pos 1)
+                         x)
+                     y))
+            (else
+             (fold-display str)))))
+
+  (cond ((<= h 0) (values pos wc w 0 x y))
+        ((string-scan str #\newline)
+         => (lambda (idx) 
+              (receive (pos wc w h x y)
+                  (display-line (substring str 0 idx))
+                (newline)
+                (display-string (substring str (+ idx 1)
+                                           (string-length str))
+                                (- pos 1)
+                                0
+                                full-width
+                                (- h 1)
+                                (if (> pos 0)
+                                    pos
+                                    x)
+                                (if (> pos 0)
+                                    (+ y 1)
+                                    y)
+                                full-width))))
+        (else
+         (display-line str))))
+
+;;; EOF
