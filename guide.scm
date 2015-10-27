@@ -1,3 +1,8 @@
+(load "./ggc.scm")
+(select-module user)
+;;;
+;;;  GUIDE
+;;;
 (define debug? #f)
 (use srfi-1)
 (use srfi-13)
@@ -5,16 +10,11 @@
 (use gauche.vport)
 (use file.util)
 (use text.diff)
-;;
-;;(use ggc.file.util)
-;;(use ggc.util.circular-list)
-;;(use ggc.term.with-raw-mode)
-;;(use ggc.text.segment)
-(load "./ggc.scm")
-(import ggc.file.util
-        ggc.util.circular-list
-        ggc.term.with-raw-mode
-        ggc.text.segment)
+(use ggc.file.util)
+(use ggc.util.circular-list)
+(use ggc.term.with-raw-mode)
+(use ggc.text.segment)
+
 ;;;
 ;;;
 (define (get-real-time)
