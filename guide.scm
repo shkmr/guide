@@ -1705,9 +1705,11 @@
            (cln  (text-line-number text pos))
            (rln  (text-number-of-lines text pos))
            (tln  (+ cln rln -1))
-           (start-pos (start-of win))
+           (start-pos (text-beginning-of-line text (start-of win) 1))
            (start-ln  (text-line-number text start-pos)))
 
+      ;; XXX: start-of should be line number, not pos of text!!
+      (set! (start-of win) start-pos)
       (if (<= tln (height-of win)) 
           (set! (start-of win) 0))
 
@@ -1850,7 +1852,6 @@
         (else
          (display-line str pos wc w h x y full-width))))
 
-;;; (vt100-string-width "a" -1)
 (define (display-line str pos wc w h x y full-width)
   (cond ((= h 0) (values pos wc w h x y))
         ((< h 0) (error "h < 0!!"))
