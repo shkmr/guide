@@ -1727,9 +1727,15 @@
                         (- pos (start-of win))
                         (width-of frame)
                         (height-of win))
-        (dotimes (x h) (newline))
-        (display-mode-line buf cx cy)
-        (values cx cy))))
+        (cond ((> cy (height-of win))
+               (set! (start-of win) (text-end-of-line text (start-of win) 4))
+               (set! (start-of win) (text-beginning-of-line text (start-of win) 1))
+               (vt100-coursor-up (height-of win))
+               (display-window win))
+              (else
+               (dotimes (x h) (newline))
+               (display-mode-line buf cx cy)
+               (values cx cy))))))
 
   (display (with-output-to-string
              (lambda ()
@@ -1761,6 +1767,11 @@
 (define (vt100-reverse-video) (display "\x1b[7m"))
 (define (vt100-normal-video)  (display "\x1b[0m"))
 (define (vt100-cursor-position x y) (format #t "\x1b\x5b~d;~dH" y x))
+(define (vt100-cursor-up    n)      (formast #t "\x1b[~dA]" n))
+(define (vt100-cursor-down  n)      (formast #t "\x1b[~dB]" n))
+(define (vt100-cursor-right n)      (formast #t "\x1b[~dC]" n))
+(define (vt100-cursor-left  n)      (formast #t "\x1b[~dD]" n))
+
 
 (define (vt100-cursor-position1 x y)
   (format #t "\x1b[~d;0H" y)
@@ -1839,16 +1850,20 @@
          => (lambda (idx) 
               (receive (pos wc w h x y)
                   (display-line (substring str 0 idx) pos wc w h x y full-width)
-                (newline)
-                (display-string (substring str (+ idx 1)
-                                           (string-length str)) ; str
-                                (- pos 1)                       ; pos
-                                0                               ; wc
-                                full-width                      ; w
-                                (- h 1)                         ; h
-                                (if (> pos 0) 1       x)        ; x
-                                (if (> pos 0) (+ y 1) y)        ; y
-                                full-width))))
+                (cond ((= h 0)
+                       (values pos wc w 0 x y))
+                      ((< h 0) (error "h < 0!"))
+                      (else
+                       (newline)
+                       (display-string (substring str (+ idx 1)
+                                                  (string-length str)) ; str
+                                       (- pos 1)                       ; pos
+                                       0                               ; wc
+                                       full-width                      ; w
+                                       (- h 1)                         ; h
+                                       (if (> pos 0) 1       x)        ; x
+                                       (if (> pos 0) (+ y 1) y)        ; y
+                                       full-width))))))
         (else
          (display-line str pos wc w h x y full-width))))
 
