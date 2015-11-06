@@ -1,19 +1,22 @@
-(load "./ggc.scm")
-(select-module user)
 ;;;
 ;;;  GUIDE
 ;;;
+(define-module guide
+  (use srfi-1)
+  (use srfi-13)
+  (use gauche.process)
+  (use gauche.vport)
+  (use file.util)
+  (use text.diff)
+  (use ggc.file.util)
+  (use ggc.util.circular-list)
+  (use ggc.term.with-raw-mode)
+  (use ggc.text.segment)
+  (export guide guide-main)
+  )
+(select-module guide)
+
 (define debug? #f)
-(use srfi-1)
-(use srfi-13)
-(use gauche.process)
-(use gauche.vport)
-(use file.util)
-(use text.diff)
-(use ggc.file.util)
-(use ggc.util.circular-list)
-(use ggc.term.with-raw-mode)
-(use ggc.text.segment)
 
 ;;;
 ;;;
@@ -642,7 +645,7 @@
 ;;;
 (define (print-buffers)
   (define (prn buf)
-    (format #t "  ~14,,,14:a ~8d   ~,,,,30:a~%"
+    (format #t "  ~14,,,,14:a ~8d   ~,,,,30:a~%"
             (if (> (string-length (name-of buf)) 20)
                 (substring (name-of buf) 
                            (- (string-length (name-of buf)) 20)
@@ -650,7 +653,7 @@
                 (name-of buf))
             (text-size (text-of buf))
             (filename-of buf)))
-  (format #t "  ~14,,,14:a ~8@a   ~,,,,30:a~%" "Name" "Size" "File")
+  (format #t "  ~14,,,,14:a ~8@a   ~,,,,30:a~%" "Name" "Size" "File")
   (circular-for-each prn (buffers-of the-editor)))
 
 (define (list-buffers arg)
@@ -1316,16 +1319,21 @@
    (frames :init-value '()
            :accessor frames-of)
    (kring  :init-value '()
-            :accessor kill-ring-of)
+           :accessor kill-ring-of)
    (alarm-list :init-value '()
-               :accessor alarm-list-of)))
+               :accessor alarm-list-of)
+   (cont   :init-value #f
+           :accessor continuation-of)
+))
 
 (define (put-alarm-list! thunk)
   (push! (alarm-list-of the-editor) thunk))
 
 (define (exit-editor editor)
   (for-each delete-frame (frames-of editor))
-  (exit 0))
+  (if (continuation-of editor)
+      ((continuation-of editor) 0)
+      (exit 0)))
 
 (define (message . args)
   ;; Is it better to move to the end of buffer?
@@ -1460,35 +1468,52 @@
 
     (push! (frames-of editor) frame)))
 
-(define (make-editor)
+(define (make-editor cont)
   (let ((editor (make <editor>))
         (msgbuf (make <text-buffer> :name "*Messages*")))
-    
+
     (initialize-key-map editor)
     (set! (key-map-of msgbuf) (copy-key-map (global-key-map-of editor)))
-
     (buffer-let-window-always-follow-point msgbuf)
     (buffer-make-persistent msgbuf)
     (set! (buffers-of editor) (circular-list msgbuf))
+    (set! (continuation-of editor) cont)
 
     editor))
 
 ;;;
 ;;;  INIT MAIN
 ;;;
-(define (initialize-the-editor)
-  (set! the-editor (make-editor))
+(define (initialize-the-editor cont)
+  (set! the-editor (make-editor cont))
   (add-frame the-editor <vt100-frame>)
+  (set-signal-handler! SIGWINCH vt100-sigwinch-handler)
+  (set-signal-handler! SIGALRM  alarm-handler)
   (sync-buffers-and-windows)
   (let ((schbuf (make-buffer "*scratch*")))
     (select-buffer schbuf)))
 
-(define (main args)
+;;;
+;;; main to be called from command line
+;;; 
+(define (guide-main args)
   (sys-system "stty min 1 time 0")  ; SunOS 5.8
   (with-raw-mode  (lambda () (apply run (cdr args))))
   ;; Do we need to restore min and time above?
   )
 
+;;;
+;;; main to be called from gosh repl
+;;; 
+(define (guide . args)
+  (sys-system "stty min 1 time 0")  ; SunOS 5.8
+  (with-raw-mode  (lambda () (apply run2 args)))
+  ;; Do we need to restore min and time above?
+  )
+
+;;;
+;;;
+;;;
 (if debug?
     (define (with-output-and-error-to-port port thunk) (thunk))
     (define (with-output-and-error-to-port port thunk)
@@ -1500,16 +1525,37 @@
   (set! (alarm-list-of the-editor) '())
   (update-display))
 
+;;;
+;;; standard emacs like startup
+;;;
 (define (run . args)
-  (initialize-the-editor)
+  (initialize-the-editor exit)
   (sync-buffers-and-windows)
-  (set-signal-handler! SIGWINCH vt100-sigwinch-handler)
-  (set-signal-handler! SIGALRM alarm-handler)
   (let ((errp (open-output-text-buffer (get-buffer "*Messages*"))))
     (with-output-and-error-to-port errp 
                                    (lambda () 
                                      (for-each find-file args)
                                      (interactive-loop)))))
+
+;;;
+;;; split-window
+;;;
+(define (run2 . args)
+  (call/cc
+   (lambda (cont)
+     (initialize-the-editor cont)
+     (sync-buffers-and-windows)
+     (let ((errp (open-output-text-buffer (get-buffer "*Messages*"))))
+       (with-output-and-error-to-port errp 
+                                      (lambda () 
+                                        (for-each find-file args)
+                                        (select-buffer "*Messages*")
+                                        (sync-buffers-and-windows)
+                                        (split-window)
+                                        (other-window)
+                                        (sync-buffers-and-windows)
+                                        (switch-to-buffer '())
+                                        (interactive-loop)))))))
 
 ;;;
 ;;;  VT100 FRAME :-)
@@ -1550,12 +1596,8 @@
 (define-method get-size ((frame <vt100-frame>)) (vt100-get-size))
 
 (define-method get-event ((frame <vt100-frame>))
-
-  (define (read-utf-8-macosx-terminal)
-
-    ;; In MacOSX each UTF-8 byte is preambled by SYN(0x16)
-    (define (read-one) (read-byte) (read-byte))
-
+  
+  (define (read-utf8 read-one)
     (let ((x1 (read-byte))
           (x2 (read-one)))
       (cond ((= #b110 (bit-field x1 5 8))
@@ -1596,16 +1638,22 @@
             (else
              (error "in get-event")))))
 
+  ;; In old MacOSX each UTF-8 byte is preambled by SYN(0x16)
+  (define (read-one-macosx) (read-byte) (read-byte))
+
   (with-input-from-port (input-port-of frame)
     (lambda ()
-      (if (= (peek-byte) 22)
-          (begin
-            (read-byte)
-            (if (or (not (char-ready? (current-input-port)))
-                    (= (logand #x80 (peek-byte)) 0))
-                22
-                (read-utf-8-macosx-terminal)))
-          (read-byte)))))
+      (let ((x (peek-byte)))
+        (cond ((= x 22)
+               (read-byte)
+               (if (or (not (char-ready? (current-input-port)))
+                       (= (logand #x80 (peek-byte)) 0))
+                   22
+                   (read-utf8 read-one-macosx)))
+              ((> x 127)
+               (read-utf8 read-byte))
+              (else
+               (read-byte)))))))
 
 (define-method event-pending? ((frame <vt100-frame>))
   (char-ready? (input-port-of frame)))
@@ -1737,17 +1785,19 @@
 
 (define (vt100-char-width ch)
   (cond ((number? ch) 0)
-        ((< (char->ucs ch) 32) 0)
+        ((< (char->ucs ch) 32)  0)
         ((< (char->ucs ch) 256) 1)
         (else 2)))
 
 (define (vt100-string-width str idx)
-  (let loop ((i     0)
-             (width 0))
-    (if (>= i idx)
-        width
-        (loop (+ i 1) 
-              (+ width (vt100-char-width (string-ref str i 0)))))))
+  (if (<= idx 0)
+      0
+      (let lp ((width 0)
+               (i     0))
+        (if (< i idx)
+            (lp (+ width (vt100-char-width (string-ref str i 0)))
+                (+ i 1))
+            width))))
 
 (define (vt100-string-index-by-width str width)
   (let ((len (string-length str)))
@@ -1755,160 +1805,83 @@
                (width width))
       (cond ((>= i len) len)
             ((= width 0) i)
-            ((< width 0) (- i 1))
+            ((< width 0) (if (> i 0) (- i 1) 0))
             (else
              (loop (+ i 1)
                    (- width 
                       (vt100-char-width (string-ref str i 0)))))))))
 ;;;
-;;;
+;;; display text inside box of width and height
+;;; returns cursor posision x y and number of empty lines h.
 ;;;
 (define (display-text text pos width height)
   (let loop ((text text)
-             (pos pos)
-             (wc  0)
-             (w   width)
-             (h   height)
-             (x   1)
-             (y   1))
+             (pos  pos)
+             (wc   0)
+             (w    width)
+             (h    height)
+             (x    1)
+             (y    1))
     (cond ((null? text) (values w h x y))
-          ((<= h 0)     (values w 0 x y))
+          ((= h 0)      (values w 0 x y))
+          ((< h 0)      (error "h < 0!!"))
           (else
            (receive (pos wc w h x y) 
                (display-string (car text) pos wc w h x y width)
              (loop (cdr text) pos wc w h x y))))))
 
-(define (display-text-n text pos width height)
-  (let loop ((text text)
-             (p pos)
-             (x 0)
-             (y 0)
-             (h height))
-    (receive (idx next) (text-find-character-after text pos #\newline)
-      (if idx 
-          (receive (p x y h)
-              (display-line (text->string (text-get-text text 0 idx))
-                            p width h x y)
-            (loop next p x y h))
-          (receive (p x y h)
-              (display-line (text->string (text-get-text text 0 next))
-                            p width h x y)
-            (values p x y h))))))
-
-(define (display-line str pos width height x y)
-  (let ((len (string-length str))
-        (idx (vt100-string-index-by-width str width)))
-    (cond ((<= height 0) (values pos x y 0))
-          ((zero? idx)   (values pos x y height))
-          ((= idx len)
-           (display str)
-           (values (- pos len) 
-                   (if (>= pos 0) pos x)
-                   y
-                   height))
-          (else
-           (display (substring str 0 (- idx 1)))
-           (display "\\\n")
-           (display-line (substring str (- idx 1) len)
-                         (- pos idx -1)
-                         width
-                         (- height 1)
-                         (if (>= pos 0) pos x)
-                         (if (>= (- pos idx -1) 0)
-                             (+ y 1)
-                             y))))))
-
-#|
-(begin (newline)
-       (receive x (display-line "01234567890123456789012" 22 11 2 0 0)
-         (newline)
-         (print x)))
-|#
-
-
 (define (display-string str pos wc w h x y full-width)
-
-  (define (trim-display str)
-    (let ((idx (vt100-string-index-by-width str (if (> w 3) (- w 3) 0))))
-      (display (substring str 0 idx))
-      (display "$")
-      (values (- pos (string-length str))
-              0
-              full-width
-              h
-              (if (>= pos 0)
-                  (+ wc pos 1)
-                  x)
-              y)))
-
-  (define (fold-display str)
-    (let ((idx (vt100-string-index-by-width str (- w 1))))
-      (cond ((> idx 0)
-             (display (substring str 0 (- idx 1)))
-             (display "\\\n")
-             (display-string (substring str (- idx 1) 
-                                        (string-length str))
-                             (- pos idx -1)
-                             0
-                             full-width
-                             (- h 1)
-                             (if (>= pos 0)
-                                 (+ wc pos 1)
-                                 x)
-                             (if (>= (- pos idx -1) 0)
-                                 (+ y 1)
-                                 y)
-                             full-width))
-            (else
-             (display "\\\n")
-             (display-string str pos 0 
-                             full-width
-                             (- h 1)
-                             (if (>= pos 0)
-                                 (+ wc pos 1)
-                                 x)
-                             (if (>= (- pos idx -1) 0)
-                                 (+ y 1)
-                                 y)
-                             full-width)))))
-
-
-  (define (display-line str)
-    (let ((dispw (vt100-string-width str w))
-          (len   (string-length str)))
-      (cond ((<= dispw w)
-             (display str)
-             (values (- pos len)
-                     (+ wc len)
-                     (- w dispw)
-                     h
-                     (if (>= pos 0)
-                         (+ wc pos 1)
-                         x)
-                     y))
-            (else
-             (fold-display str)))))
-
-  (cond ((<= h 0) (values pos wc w 0 x y))
+  (cond ((= h 0) (values pos wc w 0 x y))
+        ((< h 0) (error "h < 0!!"))
         ((string-scan str #\newline)
          => (lambda (idx) 
               (receive (pos wc w h x y)
-                  (display-line (substring str 0 idx))
+                  (display-line (substring str 0 idx) pos wc w h x y full-width)
                 (newline)
                 (display-string (substring str (+ idx 1)
-                                           (string-length str))
-                                (- pos 1)
-                                0
-                                full-width
-                                (- h 1)
-                                (if (> pos 0)
-                                    pos
-                                    x)
-                                (if (> pos 0)
-                                    (+ y 1)
-                                    y)
+                                           (string-length str)) ; str
+                                (- pos 1)                       ; pos
+                                0                               ; wc
+                                full-width                      ; w
+                                (- h 1)                         ; h
+                                (if (> pos 0) 1       x)        ; x
+                                (if (> pos 0) (+ y 1) y)        ; y
                                 full-width))))
         (else
-         (display-line str))))
+         (display-line str pos wc w h x y full-width))))
 
+;;; (vt100-string-width "a" -1)
+(define (display-line str pos wc w h x y full-width)
+  (cond ((= h 0) (values pos wc w h x y))
+        ((< h 0) (error "h < 0!!"))
+        ((string=? str "") (values pos wc w h x y))
+        (else
+         (let ((dispw (vt100-string-width str (string-length str)))
+               (len   (string-length str)))
+           (cond ((< dispw w)
+                  (display str)
+                  (values (- pos len)
+                          (+ wc dispw)
+                          (- w  dispw)
+                          h
+                          (if (and (> pos 0) (<= pos len))
+                              (+ wc (vt100-string-width str pos) +1)
+                              x)
+                          y))
+                 (else
+                  (let ((idx (- (vt100-string-index-by-width str w) 1)))
+                    (display (substring str 0 idx))
+                    (display "\\\n")
+                    (display-line (substring str idx len)
+                                  (- pos idx)
+                                  0
+                                  full-width
+                                  (- h 1)
+                                  (if (and (> pos 0) (<= pos idx))
+                                      (+ wc (vt100-string-width str pos) +1)
+                                      x)
+                                  (if (> pos idx) (+ y 1) y)
+                                  full-width))))))))
+
+(provide "guide")
 ;;; EOF

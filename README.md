@@ -4,16 +4,14 @@ Gauche Unpleasant Integrated Design Environment
                
 This is basically junk grade emacs written in Gauche.
 
-How to play:
+How to start:
 
-     $ gosh guide.scm
-     
-Example: 
-     
-      C-x 2 C-x b            => split screen into *scratch* and *Messages*.
-      C-x o                  => Goto *scratch*
-      (+ 1 2) C-x C-e        => shows `=> 3` in *Messages*.
+     $ gosh -l./ggc.scm -l./guide.scm
+     gosh> (use guide)
+     gosh> (guide)
 
+Two buffers, *scratch* and *Messages*, appears.
+C-x C-c will exit guide and return to gosh's REPL.
 
 `ggc.scm` consists of three modules from [Gauche Garbage Collection](http://sourceforge.net/p/gauchegc/code/ci/master/tree/) (`ggc.file.util`, `ggc.term.with-raw-mode`, `ggc.text.segment`.)
 
