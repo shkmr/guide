@@ -12,7 +12,7 @@ How to start:
 
 Two buffers, *scratch* and *Messages*, appears.
 C-x C-c will exit guide and return to gosh's REPL.
-In *scrach* buffer, C-j is eval-last-sexp and
+In *scratch* buffer, C-j is eval-last-sexp and
 C-c C-r is eval-region. For example,
 
     (+ 1 2) C-j
