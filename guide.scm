@@ -755,6 +755,7 @@
                          (lp (read) v)))))))))
 
 (define-command eval-last-sexp (buf)
+  ;; XXX This needs to be smarter.
   (let ((text (text-of buf)))
     (cond ((let ((beg (text-beginning-of-line text (point-of buf) 1)))
              (and beg (read-last-sexp text beg (- (point-of buf) beg))))
@@ -1710,20 +1711,17 @@
            (tln  (+ cln rln -1))
            (start-pos (text-beginning-of-line text (start-of win) 1))
            (start-ln  (text-line-number text start-pos)))
-
-      ;; XXX: start-of should be line number, not pos of text!!
+      ;;
+      ;; XXX: start-of should not be pos of text, linenumber or something.
+      ;;
       (set! (start-of win) start-pos)
-      (if (<= tln (height-of win)) 
+      (if (<= tln (height-of win))
           (set! (start-of win) 0))
-
       (if (< cln start-ln)
           (set! (start-of win) (text-beginning-of-line text pos 1)))
-
       (if (>= cln (+ start-ln (height-of win)))
-          (set! (start-of win) (+ 1 (text-end-of-line text 
-                                                      0
-                                                      (- cln 
-                                                         (height-of win))))))
+          (set! (start-of win) (+ 1 (text-end-of-line text 0
+                                                      (- cln (height-of win))))))
       (receive (w h cx cy)
           (display-text (text-get-text (text-of buf)
                                        (start-of win) -1)
@@ -1731,12 +1729,16 @@
                         (width-of frame)
                         (height-of win))
         (cond ((> cy (height-of win))
+               ;;
+               ;; In case cursor is out of window, scroll up.
+               ;; This happens line at the bottom is wider than the window.
+               ;;
                (set! (start-of win) (text-end-of-line text (start-of win) 4))
                (set! (start-of win) (text-beginning-of-line text (start-of win) 1))
                (vt100-cursor-up (height-of win))
                (display-window win))
               (else
-               (dotimes (x h) (newline))
+               (dotimes (x h) (newline))      ; fill-up window
                (display-mode-line buf cx cy)
                (values cx cy))))))
 
@@ -1775,12 +1777,10 @@
 (define (vt100-cursor-right n)      (format #t "\x1b[~dC]" n))
 (define (vt100-cursor-left  n)      (format #t "\x1b[~dD]" n))
 
-
 (define (vt100-cursor-position1 x y)
   (format #t "\x1b[~d;0H" y)
   (if (not (= x 0))
       (format #t "\x1b[~dC" x)))
-
 
 (define (vt100-get-size)
   ;; "VAR=VAL;"
