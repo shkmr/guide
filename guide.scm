@@ -1730,7 +1730,7 @@
         (cond ((> cy (height-of win))
                (set! (start-of win) (text-end-of-line text (start-of win) 4))
                (set! (start-of win) (text-beginning-of-line text (start-of win) 1))
-               (vt100-coursor-up (height-of win))
+               (vt100-cursor-up (height-of win))
                (display-window win))
               (else
                (dotimes (x h) (newline))
@@ -1767,10 +1767,10 @@
 (define (vt100-reverse-video) (display "\x1b[7m"))
 (define (vt100-normal-video)  (display "\x1b[0m"))
 (define (vt100-cursor-position x y) (format #t "\x1b\x5b~d;~dH" y x))
-(define (vt100-cursor-up    n)      (formast #t "\x1b[~dA]" n))
-(define (vt100-cursor-down  n)      (formast #t "\x1b[~dB]" n))
-(define (vt100-cursor-right n)      (formast #t "\x1b[~dC]" n))
-(define (vt100-cursor-left  n)      (formast #t "\x1b[~dD]" n))
+(define (vt100-cursor-up    n)      (format #t "\x1b[~dA]" n))
+(define (vt100-cursor-down  n)      (format #t "\x1b[~dB]" n))
+(define (vt100-cursor-right n)      (format #t "\x1b[~dC]" n))
+(define (vt100-cursor-left  n)      (format #t "\x1b[~dD]" n))
 
 
 (define (vt100-cursor-position1 x y)
