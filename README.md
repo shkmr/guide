@@ -11,11 +11,11 @@ How to start:
      gosh> (guide)
 
 Two buffers, *scratch* and *Messages*, appears.
-C-x C-c will exit guide and return to gosh's REPL.
-In *scratch* buffer, C-j is eval-last-sexp and
-C-c C-r is eval-region. For example,
+`C-x C-c` will exit guide and return to gosh's REPL.
+In *scratch* buffer, `C-j` is eval-last-sexp and
+`C-c C-r` is eval-region. For example,
 
-    (+ 1 2) C-j
+    (+ 1 2) `C-j`
     
 will show
 
