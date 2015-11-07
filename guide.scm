@@ -710,6 +710,8 @@
   (for-each (lambda (x) (display " ") (write/ss x)) vals))
 
 (define (eval-and-print expr)
+  (write expr)
+  (newline)
   (call-with-values (lambda () (eval expr (interaction-environment)))
     print-values))
 
@@ -727,6 +729,7 @@
                 list)))))
   
   (let ((str (region->string buf from to)))
+    (print str)
     (apply print-values (with-input-from-string str eval-port))))
         
 (define-method eval-region (x)
