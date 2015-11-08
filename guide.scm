@@ -1363,12 +1363,6 @@
 (define (put-alarm-list! thunk)
   (push! (alarm-list-of the-editor) thunk))
 
-(define (exit-editor editor)
-  (for-each delete-frame (frames-of editor))
-  (if (continuation-of editor)
-      ((continuation-of editor) 0)
-      (exit 0)))
-
 (define (message . args)
   ;; Is it better to move to the end of buffer?
   (apply format (cons (current-error-port) args)))
@@ -1449,7 +1443,7 @@
     (define-key kmap "\\C-v"  scroll-up)
     (define-key kmap "\\C-w"  kill-region)
     (define-key kmap "\\C-y"  yank)
-    (define-key kmap "\\C-z"  no-such-command)
+    (define-key kmap "\\C-z"  suspend-guide)
     (define-key kmap "\\M-g"  goto-line-interactive)
     (define-key kmap "\\M-v"  scroll-down)
     (define-key kmap "\\M-w"  copy-region)
@@ -1481,7 +1475,25 @@
     (define-key kmap "\\C-x\\C-x" exchange-point-and-mark)
     ))
 
-(define (exit-guide arg) (exit-editor the-editor))
+(define (exit-guide arg)
+  (for-each delete-frame (frames-of the-editor))
+  (let ((e the-editor))
+    (set! the-editor #f)
+    (if (continuation-of e)
+        ((continuation-of e) 0)
+        (exit 0))))
+
+(define (suspend-guide arg)
+  (for-each delete-frame (frames-of the-editor))
+  (call/cc (lambda (k)
+             (let ((r (continuation-of the-editor)))
+               (set! (continuation-of the-editor) k)
+               (r 'suspend)))))
+
+(define (resume-guide k)
+  (let ((r (continuation-of the-editor)))
+    (set! (continuation-of the-editor) k)
+    (r 0)))
 
 (define (make-empty-frame frame-class)
   (let ((frame (make frame-class)))
@@ -1532,8 +1544,15 @@
 ;;; main to be called from command line
 ;;; 
 (define (guide-main args)
-  (sys-system "stty min 1 time 0")  ; SunOS 5.8
-  (with-raw-mode  (lambda () (apply run (cdr args))))
+  (sys-system "stty min 1 time 0")      ; SunOS 5.8
+  (let guide ()
+    (let ((status (if the-editor
+                      (call/cc (lambda (k) (resume-guide k)))
+                      (with-raw-mode (lambda () (apply run2 (cdr args)))))))
+      (cond ((integer? status) status)
+            (else                       ; 'suspend
+             (sys-kill (sys-getpid) SIGSTOP)
+             (guide)))))
   ;; Do we need to restore min and time above?
   )
 
@@ -1542,9 +1561,9 @@
 ;;; 
 (define (guide . args)
   (sys-system "stty min 1 time 0")  ; SunOS 5.8
-  (with-raw-mode  (lambda () (apply run2 args)))
-  ;; Do we need to restore min and time above?
-  )
+  (if the-editor
+      (call/cc (lambda (k) (resume-guide k)))
+      (with-raw-mode  (lambda () (apply run2 args)))))
 
 ;;;
 ;;;
@@ -1605,7 +1624,9 @@
   (with-output-to-port (output-port-of frame)
     (lambda ()
       (vt100-cursor-position 1 (height-of frame))
-      (vt100-show-cursor))))
+      (vt100-show-cursor)
+      (flush)
+      )))
 
 (define (vt100-sigwinch-handler sig)
   (receive (x y) (vt100-get-size)
