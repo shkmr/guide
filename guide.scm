@@ -106,7 +106,7 @@
                (buffer-push-history buf))))))
 
 (define (buffer-flatten-text buf)
-  (set! (text-of buf) (list (text->string (text-of buf)))))
+  (set! (text-of buf) (text-flatten (text-of buf))))
 
 (define (buffer-replace-text buf text)
   (update-buffer buf (lambda (buf pos arg) text) 0 1)
@@ -397,11 +397,11 @@
   (set! (buffers-of the-editor) (cdr (buffers-of the-editor))))
 
 (define (switch-to-buffer arg)
-  (let* ((default (name-of (cadr (buffer-list))))
-         (prompt  (format #f "Switch to buffer (default ~a): " default))
+  (let* ((next (name-of (cadr (buffer-list))))
+         (prompt  (format #f "Switch to buffer (default ~a): " next))
          (name    (read-from-mini-buffer prompt '())))
     (if (string=? name "")
-        (select-buffer default)
+        (switch-to-next-buffer '())
         (select-buffer name))))
 
 (define (find-buffer-function pred) 
