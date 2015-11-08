@@ -1743,11 +1743,11 @@
           (set! (start-of win) (+ 1 (text-end-of-line text 0
                                                       (- cln (height-of win))))))
       (receive (w h cx cy)
-          (display-text (text-get-text (text-of buf)
-                                       (start-of win) -1)
-                        (- pos (start-of win))
-                        (width-of frame)
-                        (height-of win))
+          (vt100-display-text (text-get-text (text-of buf)
+                                             (start-of win) -1)
+                              (- pos (start-of win))
+                              (width-of frame)
+                              (height-of win))
         (cond ((> cy (height-of win))
                (message "rollover cy=~d  (height-of win)=~d~%" cy (height-of win))
                ;;
@@ -1865,7 +1865,7 @@
 ;;; display text inside box of width and height
 ;;; returns cursor posision x y and number of empty lines h.
 ;;;
-(define (display-text text pos width height)
+(define (vt100-display-text text pos width height)
   (let loop ((text text)
              (pos  pos)
              (wc   0)
@@ -1878,35 +1878,35 @@
           ((< h 0)      (error "h < 0!!"))
           (else
            (receive (pos wc w h x y) 
-               (display-string (car text) pos wc w h x y width)
+               (vt100-display-string (car text) pos wc w h x y width)
              (loop (cdr text) pos wc w h x y))))))
 
-(define (display-string str pos wc w h x y full-width)
+(define (vt100-display-string str pos wc w h x y full-width)
   (cond ((= h 0) (values pos wc w 0 x y))
         ((< h 0) (error "h < 0!!"))
         ((string-scan str #\newline)
          => (lambda (idx) 
               (receive (pos wc w h x y)
-                  (display-line (substring str 0 idx) pos wc w h x y full-width)
+                  (vt100-display-line (substring str 0 idx) pos wc w h x y full-width)
                 (vt100-clear-eol)
                 (cond ((= h 0)
                        (values pos wc w 0 x y))
                       ((< h 0) (error "h < 0!"))
                       (else
                        (newline)
-                       (display-string (substring str (+ idx 1)
-                                                  (string-length str)) ; str
-                                       (- pos 1)                       ; pos
-                                       0                               ; wc
-                                       full-width                      ; w
-                                       (- h 1)                         ; h
-                                       (if (> pos 0) 1       x)        ; x
-                                       (if (> pos 0) (+ y 1) y)        ; y
-                                       full-width))))))
+                       (vt100-display-string (substring str (+ idx 1)
+                                                        (string-length str)) ; str
+                                             (- pos 1)          ; pos
+                                             0                  ; wc
+                                             full-width         ; w
+                                             (- h 1)            ; h
+                                             (if (> pos 0) 1       x) ; x
+                                             (if (> pos 0) (+ y 1) y) ; y
+                                             full-width))))))
         (else
-         (display-line str pos wc w h x y full-width))))
+         (vt100-display-line str pos wc w h x y full-width))))
 
-(define (display-line str pos wc w h x y full-width)
+(define (vt100-display-line str pos wc w h x y full-width)
   (cond ((= h 0) (values pos wc w h x y))
         ((< h 0) (error "h < 0!!"))
         ((string=? str "") (values pos wc w h x y))
@@ -1927,16 +1927,16 @@
                   (let ((idx (- (vt100-string-index-by-width str w) 1)))
                     (display (substring str 0 idx))
                     (display "\\\n")
-                    (display-line (substring str idx len)
-                                  (- pos idx)
-                                  0
-                                  full-width
-                                  (- h 1)
-                                  (if (and (> pos 0) (<= pos idx))
-                                      (+ wc (vt100-string-width str pos) +1)
-                                      x)
-                                  (if (> pos idx) (+ y 1) y)
-                                  full-width))))))))
+                    (vt100-display-line (substring str idx len)
+                                        (- pos idx)
+                                        0
+                                        full-width
+                                        (- h 1)
+                                        (if (and (> pos 0) (<= pos idx))
+                                            (+ wc (vt100-string-width str pos) +1)
+                                            x)
+                                        (if (> pos idx) (+ y 1) y)
+                                        full-width))))))))
 
 (provide "guide")
 ;;; EOF
