@@ -59,10 +59,10 @@
    (readonly? :init-value #f
               :accessor is-readonly?)
    (lmtime    :init-value 0.0
-              :accessor last-modified-time-of)
+              :accessor modified-time-of) ; time of last text change
    (filename  :init-value #f 
               :accessor filename-of)
-   (fmtime    :init-value 0 ; mtime of the file last visited or saved.
+   (fmtime    :init-value 0                    ; mtime of the associated file
               :accessor mtime-of)
    (history   :init-value '()
               :init-keyword :history 
@@ -81,7 +81,7 @@
   (set! (is-persistent? buf) #f)
   (set! (is-modified? buf)   #f)
   (set! (is-readonly? buf)   #t)
-  (set! (last-modified-time-of buf) 0)
+  (set! (modified-time-of buf) 0)
   (set! (filename-of buf)    #f)
   (set! (mtime-of buf)       0)
   (set! (history-of buf)    '())
@@ -93,25 +93,57 @@
   (if (is-readonly? buf) 
       (quit "Read only buffer")))
 
-(define (update-buffer buf update pos arg)
+(define (update-buffer buf m pos arg)
+
+  (define (do-insert str)
+    (let-syntax ((update! (syntax-rules ()
+                            ((_ loc)
+                             (if (>= loc pos)
+                                 (inc! loc (string-length str)))))))
+      (set! (text-of buf) (text-insert (text-of buf) pos str))
+      (update! (point-of buf))
+      (update! (mark-of buf))))
+
+  (define (do-delete count)
+    (let-syntax ((update! (syntax-rules ()
+                            ((_ loc)
+                             (cond ((> loc (+ pos count))
+                                    (dec! loc (+ pos count)))
+                                   ((> loc pos)
+                                    (set! loc pos)))))))
+      ;; XXX need to check range of count
+      (set! (text-of buf) (text-delete (text-of buf) pos count))
+      (update! (point-of buf))
+      (update! (mark-of buf))))
+
+  (define (do-replace text)
+    (set! (text-of  buf) text)
+    (set! (point-of buf) 0)
+    (set! (mark-of  buf) 0))
+
   (error-if-readonly buf)
-  (if (not (eq? arg 0))
-      (let ((current-time    (get-real-time))
-            (last-modified   (last-modified-time-of buf))
-            (new-text        (update (text-of buf) pos arg)))
-        (set! (text-of buf) new-text)
-        (cond ((> (- current-time last-modified) 0.2)
-               (set! (last-modified-time-of buf) current-time)
-               (set! (is-modified? buf) #t)
-               (buffer-push-history buf))))))
+
+  (let ((curtime (get-real-time))
+        (modtime (modified-time-of buf)))
+    (if (> (- curtime modtime) 0.2) (buffer-push-history buf)))
+    
+  (case m
+    ((insert)  (do-insert  arg))
+    ((delete)  (do-delete  arg))
+    ((replace) (do-replace arg))
+    (else
+     (message "update-buffer: unknown method: ~a" m)))
+
+  (set! (modified-time-of buf) (get-real-time))
+  (set! (is-modified? buf) #t)
+  )
+
 
 (define (buffer-flatten-text buf)
   (set! (text-of buf) (text-flatten (text-of buf))))
 
 (define (buffer-replace-text buf text)
-  (update-buffer buf (lambda (buf pos arg) text) 0 1)
-  (set! (point-of buf) 0)
-  (set! (mark-of buf) 0))
+  (update-buffer buf 'replace 0 text))
 
 (define-method region->string ((buf <text-buffer>)
                               (from <integer>)
@@ -132,15 +164,11 @@
 
 (define (buffer-set-filename buf fname)
   (set! (filename-of buf) fname)
-  (if (file-is-regular? fname)
-      (buffer-set-mtime buf)))
-
-(define (buffer-set-mtime buf)
-  (if (filename-of buf)
-      (let ((mtime (sys-stat->mtime (sys-stat (filename-of buf)))))
-        (set! (mtime-of buf) mtime)
-        (set! (last-modified-time-of buf) mtime))
-      (quit "buffer is not associated with file")))
+  (let ((mtime (if (file-is-regular? fname)
+                   (sys-stat->mtime (sys-stat (filename-of buf)))
+                   0)))
+    (set! (mtime-of buf) mtime)
+    (set! (modified-time-of buf) mtime)))
 
 (define (buffer-match-mtime? buf)
   (and (mtime-of buf)
@@ -186,55 +214,54 @@
 ;;;  HISTORY
 ;;;
 (define-class <text-moment> ()
-  ((point :init-value 0
-          :init-keyword :point
-          :accessor point-of)
-   (text  :init-value '()
-          :init-keyword :text
-          :accessor text-of)
-   (mtime :init-value 0
-          :init-keyword :mtime
-          :accessor mtime-of)))
+  ((point   :init-value 0
+            :init-keyword :point
+            :accessor point-of)
+   (text    :init-value '()
+            :init-keyword :text
+            :accessor text-of)
+   (mod?    :init-keyword :modified?
+            :accessor is-modified?)
+   (time    :init-value 0
+            :init-keyword :modified-time
+            :accessor modified-time-of)))
 
 (define-method make-moment ((buf <text-buffer>))
   (make <text-moment>
-    :point (point-of buf) 
-    :text  (text-of buf)
-    :mtime (last-modified-time-of buf)))
+    :point     (point-of              buf) 
+    :text      (text-of               buf)
+    :modified? (is-modified?          buf)
+    :modified-time (modified-time-of buf)))
 
 (define (history-find-mtime history mtime)
-  (circular-find history
-                 (lambda (moment)
-                   (= mtime (mtime-of moment)))))
+  (find (lambda (moment)
+          (= mtime (mtime-of moment)))
+        history))
 
 (define (history-find-last-saved history)
-  (circular-find history
-                 (lambda (moment) 
-                   (integer? (mtime-of moment)))))
+  (find (lambda (moment) 
+          (integer? (mtime-of moment)))
+        history))
 
 (define (buffer-push-history buf)
-  (if (null? (history-of buf))
-      (set!  (history-of buf) (circular-list (make-moment buf)))
-      (circular-push! (history-of buf) (make-moment buf))))
+  (push! (history-of buf) (make-moment buf)))
 
 (define (buffer-pop-history buf)
   ;; so called ``undo''
   (if (null? (history-of buf))
       (quit "buffer does not have history")
-      (let ((moment (circular-pop! (history-of buf))))
-        (set! (is-modified? buf) #t)
-        (set! (point-of buf) (point-of moment))
-        (set! (text-of buf)  (text-of  moment)))))
+      (let ((moment (pop! (history-of buf))))
+        (set! (point-of               buf) (point-of                 moment))
+        (set! (text-of                buf) (text-of                   moment))
+        (set! (is-modified?           buf) (is-modified?              moment))
+        (set! (modified-time-of  buf) (modified-time-of     moment))
+        )))
 
 (define-method find-history-by-mtime ((buf <text-buffer>)  mtime)
   (history-find-mtime (history-of buf) mtime))
 
 (define-method find-last-saved-history ((buf <text-buffer>) n)
-  (let ((his (history-find-last-saved (history-of buf))))
-    (if his
-        (dotimes (x (+ (quotient n 4)))
-          (set! his (history-last-saved (cdr his)))))
-    his))
+  (history-find-last-saved (history-of buf)))
 
 ;;;
 ;;;   TEXT BUFFER PORT
@@ -461,7 +488,6 @@
       (let ((fn (read-from-mini-buffer "Find File: " '())))
         (find-file fn))))
 
-
 (define-command save-buffer (buf n)
   (cond ((not (filename-of buf))
          (buffer-flatten-text buf)
@@ -486,13 +512,8 @@
 (define-method insert ((buf <text-buffer>) 
                        (pos <integer>)
                        (str <string>))
-  (let-syntax ((update! (syntax-rules ()
-                          ((_ loc)
-                           (if (>= loc pos)
-                               (inc! loc (string-length str)))))))
-    (update-buffer buf text-insert pos str)
-    (update! (point-of buf))
-    (update! (mark-of buf))))
+  (update-buffer buf 'insert pos str))
+  
 
 (define-method insert ((buf <text-buffer>)
                        (str <string>))
@@ -506,15 +527,7 @@
 (define-method delete ((buf    <text-buffer>)
                        (pos    <integer>)
                        (count  <integer>))
-  (let-syntax ((update! (syntax-rules ()
-                          ((_ loc)
-                           (cond ((> loc (+ pos count))
-                                  (dec! loc (+ pos count)))
-                                 ((> loc pos)
-                                  (set! loc pos)))))))
-    (update-buffer buf text-delete pos count)
-    (update! (mark-of buf))
-    (update! (point-of buf))))
+  (update-buffer buf 'delete pos count))
 
 (define-command delete (buf count)
   (delete buf (point-of buf) count))
@@ -703,12 +716,12 @@
 (define-command print-diff (buf n)
   (define (writer str type)
     (if type (format #t "~a ~a~%" type str)))
-  (let ((history (find-last-saved-history buf n)))
-    (if history
+  (let ((moment (find-last-saved-history buf n)))
+    (if moment
         (let ((now  (text->string (text-of buf)))
-              (then (text->string (text-of (car history)))))
-          (format #t "--- ~a" (sys-ctime (mtime-of (car history))))
-          (format #t "+++ ~a" (sys-ctime (last-modified-time-of buf)))
+              (then (text->string (text-of moment))))
+          (format #t "--- ~a" (sys-ctime (mtime-of moment)))
+          (format #t "+++ ~a" (sys-ctime (modified-time-of buf)))
           (diff-report then now :writer writer)))))
 
 (define-command diff-buffer (buf n)
