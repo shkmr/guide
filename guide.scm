@@ -19,6 +19,14 @@
 (define debug? #f)
 
 ;;;
+;;; ggc.text.segment extension.
+;;;
+(define (text-goto-line text lino)
+  (let ((tmp (text-end-of-line text 0 lino)))
+    (text-beginning-of-line text tmp 1)))
+
+;;;
+;;;
 ;;;
 (define (get-real-time)
   (receive (sec usec) (sys-gettimeofday)
@@ -548,7 +556,7 @@
 
 (define-command beginning-of-line (buf count)
   (set! (point-of buf) 
-        (text-beginning-of-line (text-of  buf) (point-of buf) count)))
+        (text-beginning-of-line (text-of buf) (point-of buf) count)))
     
 (define-command end-of-line (buf count)
   (set! (point-of buf)
@@ -571,9 +579,13 @@
   (buffer-delete-line buf n buffer-delete-region))
 
 (define-command goto-line (buf n)
-  (let* ((e (text-end-of-line (text-of buf) 0 n))
-         (b (text-beginning-of-line (text-of buf) e 1)))
-    (set! (point-of buf) b)))
+  (set! (point-of buf) (text-goto-line (text-of buf) n)))
+
+(define-command goto-line-interactive (buf n)
+  (let ((ln (string->number (read-from-mini-buffer "Goto line: " '()))))
+    (if (and ln (integer? ln) (> ln 0))
+        (goto-line buf ln)
+        (message "Invalid number"))))
 
 (define-command beginning-of-buffer (buf n)
   (set-mark-command buf)
@@ -850,8 +862,11 @@
            :accessor height-of)
    (point  :init-value 0        ;; cursor point
            :accessor point-of)
-   (tmp   :init-value #f        ;; tmp cursor point
-           :accessor tmp-point-of)))
+   (tmp    :init-value #f        ;; tmp cursor point
+           :accessor tmp-point-of)
+   (frame  :init-keyword :frame
+           :accessor frame-of)))
+   
 
 (define-method get-event ((frame <frame>)) #f)
 (define-method event-pending? ((frame <frame>)) #f)
@@ -869,7 +884,7 @@
          (len (height-of win)))
     (if (< (quotient len 2) 3)
         (quit "Current Window is too small"))
-    (let ((new-win (make <text-window>))
+    (let ((new-win (make <text-window> :frame frame))
           (new-len (quotient len 2)))
       (set! (buffer-of new-win) (buffer-of win))
       (set! (height-of new-win) new-len)
@@ -937,11 +952,9 @@
   (let* ((len   (height-of win))
          (buf   (buffer-of win))
          (lino  (line-number-of (buffer-of win)))
-         (new   (- lino (quotient len 2)))
-         (new-pos (text-end-of-line (text-of buf) 0 new))
-         (new-pos (text-beginning-of-line (text-of buf) new-pos 1)))
-    (if (> new 1)
-        (set! (start-of win) new-pos)
+         (newln   (- lino (quotient len 2))))
+    (if (> newln 1)
+        (set! (start-of win) (text-goto-line (text-of buf) newln))
         (set! (start-of win) 0))))
 
 (define (recenter-window _)
@@ -954,10 +967,9 @@
          (nol     (number-of-lines-of (buffer-of win)))
          (newln   (+  sln (* hlen n))))
     (if (<= newln  (- nol hlen))
-        (let* ((new-pos (text-end-of-line (text-of buf) 0 newln))
-               (new-pos (text-beginning-of-line (text-of buf) new-pos 1)))
-          (set! (start-of win) new-pos)
-          (goto-line buf newln))
+        (let ((pos (text-goto-line (text-of buf) newln)))
+          (set! (start-of win) pos)
+          (set! (point-of buf) pos))
         (message "End of buffer"))))
 
 (define-method scroll-up (n) (scroll-up (current-window) n))
@@ -969,10 +981,9 @@
          (nol   (number-of-lines-of (buffer-of win)))
          (newln   (- sln (* hlen n))))
     (if (>= newln 1)
-        (let* ((new-pos (text-end-of-line (text-of buf) 0 newln))
-               (new-pos (text-beginning-of-line (text-of buf) new-pos 1)))
-          (set! (start-of win) new-pos)
-          (goto-line buf newln))
+        (let* ((pos (text-goto-line (text-of buf) newln)))
+          (set! (start-of win) pos)
+          (set! (point-of buf) pos))
         (message "Beginning of buffer"))))
 
 (define-method scroll-down (arg) (scroll-down (current-window) arg))
@@ -1420,6 +1431,7 @@
     (define-key kmap "\\C-w"  kill-region)
     (define-key kmap "\\C-y"  yank)
     (define-key kmap "\\C-z"  no-such-command)
+    (define-key kmap "\\M-g"  goto-line-interactive)
     (define-key kmap "\\M-v"  scroll-down)
     (define-key kmap "\\M-w"  copy-region)
     (define-key kmap "\\M-x"  no-such-command)
@@ -1461,8 +1473,8 @@
   
 (define-method add-frame ((editor <editor>)
                           (frame-class <class>))
-  (let ((frame  (make-empty-frame frame-class))
-        (window (make <text-window>)))
+  (let* ((frame  (make-empty-frame frame-class))
+         (window (make <text-window> :frame frame)))
 
     (set! (windows-of frame) (list window))
     (set! (current-window-of frame) window)
@@ -1668,7 +1680,8 @@
     (let* ((text (text-of buf))
            (to   (text-size text))
            (from (text-beginning-of-line text to 1)))
-      (print-text text from to)))
+      (print-text text from to)
+      (vt100-clear-eol)))
 
   (define (display-mini-buffer buf)
     (display (prompt-of buf))
@@ -1729,6 +1742,7 @@
                         (width-of frame)
                         (height-of win))
         (cond ((> cy (height-of win))
+               (message "rollover cy=~d  (height-of win)=~d~%" cy (height-of win))
                ;;
                ;; In case cursor is out of window, scroll up.
                ;; This happens line at the bottom is wider than the window.
@@ -1738,40 +1752,53 @@
                (vt100-cursor-up (height-of win))
                (display-window win))
               (else
-               (dotimes (x h) (newline))      ; fill-up window
+               (dotimes (x h)
+                 (vt100-clear-eol)
+                 (newline))
                (display-mode-line buf cx cy)
                (values cx cy))))))
 
-  (display (with-output-to-string
-             (lambda ()
-               (let ((x 0) (y 0)
-                     (current-window-found? #f))
-                 (vt100-hide-cursor)
-                 (vt100-clear-screen)
-                 (for-each (lambda (win)
-                             (receive (cx cy) (display-window win)
-                               (if (eq? win (current-window))
-                                   (begin
-                                     (set! current-window-found? #t)
-                                     (set! x cx)
-                                     (set! y (+ y cy))))
-                               (if (not current-window-found?)
-                                   (set! y (+ y (height-of win) 1)))))
-                           (windows-of frame))
-                 (display-echo-area)
-                 (if (mini-buffer-of frame)
-                     (vt100-move-cursor-to-echo frame)
-                     (vt100-cursor-position x y))
-                 (vt100-show-cursor)
-                 (flush))))
-           (output-port-of frame)))
+  (define (out)
+    (let ((x 0) (y 0)
+          (current-window-found? #f))
+      (vt100-hide-cursor)
+      (vt100-cursor-home)
+      (for-each (lambda (win)
+                  (receive (cx cy) (display-window win)
+                    (if (eq? win (current-window))
+                        (begin
+                          (set! current-window-found? #t)
+                          (set! x cx)
+                          (set! y (+ y cy))))
+                    (if (not current-window-found?)
+                        (set! y (+ y (height-of win) 1)))))
+                (windows-of frame))
+      (display-echo-area)
+      (if (mini-buffer-of frame)
+          (vt100-move-cursor-to-echo frame)
+          (vt100-cursor-position x y))
+      (vt100-show-cursor)
+      (flush)
+      ))
 
-(define (vt100-clear-screen)  (display "\x1b[H\x1b[2J"))
-(define (vt100-hide-cursor)   (display "\x1b[?25l"))
-(define (vt100-show-cursor)   (display "\x1b[?25h"))
+  ;;(display (with-output-to-string out) (output-port-of frame))
+  (with-output-to-port (output-port-of frame) out)
+  )
+
+;;(define (vt100-clear-screen)  (display "\x1b[H\x1b[2J"))
+(define (vt100-clear-eol)     (display "\x1b[0K"))
+(define (vt100-clear-bol)     (display "\x1b[1K"))
+(define (vt100-clear-line)    (display "\x1b[2K"))
+(define (vt100-clear-eos)     (display "\x1b[0J"))
+(define (vt100-clear-bos)     (display "\x1b[1J"))
+(define (vt100-clear-screen)  (display "\x1b[2J"))
 (define (vt100-reverse-video) (display "\x1b[7m"))
 (define (vt100-normal-video)  (display "\x1b[0m"))
-(define (vt100-cursor-position x y) (format #t "\x1b\x5b~d;~dH" y x))
+
+(define (vt100-hide-cursor)   (display "\x1b[?25l"))
+(define (vt100-show-cursor)   (display "\x1b[?25h"))
+(define (vt100-cursor-home)   (display "\x1b[H"))
+(define (vt100-cursor-position x y) (format #t "\x1b[~d;~dH" y x))
 (define (vt100-cursor-up    n)      (format #t "\x1b[~dA" n))
 (define (vt100-cursor-down  n)      (format #t "\x1b[~dB" n))
 (define (vt100-cursor-right n)      (format #t "\x1b[~dC" n))
@@ -1826,6 +1853,7 @@
              (loop (+ i 1)
                    (- width 
                       (vt100-char-width (string-ref str i 0)))))))))
+
 ;;;
 ;;; display text inside box of width and height
 ;;; returns cursor posision x y and number of empty lines h.
@@ -1853,6 +1881,7 @@
          => (lambda (idx) 
               (receive (pos wc w h x y)
                   (display-line (substring str 0 idx) pos wc w h x y full-width)
+                (vt100-clear-eol)
                 (cond ((= h 0)
                        (values pos wc w 0 x y))
                       ((< h 0) (error "h < 0!"))
