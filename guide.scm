@@ -393,9 +393,16 @@
 (define-method select-buffer ((buf <text-buffer>))
   (select-buffer-function (lambda (e) (eq? e buf))))
 
-(define (switch-to-buffer arg)
-  ;; For now ...
+(define (switch-to-next-buffer args)
   (set! (buffers-of the-editor) (cdr (buffers-of the-editor))))
+
+(define (switch-to-buffer arg)
+  (let* ((default (name-of (cadr (buffer-list))))
+         (prompt  (format #f "Switch to buffer (default ~a): " default))
+         (name    (read-from-mini-buffer prompt '())))
+    (if (string=? name "")
+        (select-buffer default)
+        (select-buffer name))))
 
 (define (find-buffer-function pred) 
   (cond ((circular-find (buffer-list) pred) => car)
@@ -1570,7 +1577,7 @@
                                         (split-window)
                                         (other-window)
                                         (sync-buffers-and-windows)
-                                        (switch-to-buffer '())
+                                        (switch-to-next-buffer '())
                                         (interactive-loop)))))))
 
 ;;;
