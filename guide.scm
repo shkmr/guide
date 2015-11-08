@@ -88,7 +88,6 @@
   (set! (key-map-of buf)    #f)
   )
 
-
 (define-method error-if-readonly ((buf <text-buffer>))
   (if (is-readonly? buf) 
       (quit "Read only buffer")))
@@ -137,7 +136,6 @@
   (set! (modified-time-of buf) (get-real-time))
   (set! (is-modified? buf) #t)
   )
-
 
 (define (buffer-flatten-text buf)
   (set! (text-of buf) (text-flatten (text-of buf))))
@@ -228,9 +226,9 @@
 
 (define-method make-moment ((buf <text-buffer>))
   (make <text-moment>
-    :point     (point-of              buf) 
-    :text      (text-of               buf)
-    :modified? (is-modified?          buf)
+    :point         (point-of         buf) 
+    :text          (text-of          buf)
+    :modified?     (is-modified?     buf)
     :modified-time (modified-time-of buf)))
 
 (define (history-find-mtime history mtime)
@@ -240,7 +238,7 @@
 
 (define (history-find-last-saved history)
   (find (lambda (moment) 
-          (integer? (mtime-of moment)))
+          (not (is-modified? moment)))
         history))
 
 (define (buffer-push-history buf)
@@ -251,10 +249,10 @@
   (if (null? (history-of buf))
       (quit "buffer does not have history")
       (let ((moment (pop! (history-of buf))))
-        (set! (point-of               buf) (point-of                 moment))
-        (set! (text-of                buf) (text-of                   moment))
-        (set! (is-modified?           buf) (is-modified?              moment))
-        (set! (modified-time-of  buf) (modified-time-of     moment))
+        (set! (point-of         buf) (point-of         moment))
+        (set! (text-of          buf) (text-of          moment))
+        (set! (is-modified?     buf) (is-modified?     moment))
+        (set! (modified-time-of buf) (modified-time-of moment))
         )))
 
 (define-method find-history-by-mtime ((buf <text-buffer>)  mtime)
@@ -715,12 +713,14 @@
 ;;;
 (define-command print-diff (buf n)
   (define (writer str type)
-    (if type (format #t "~a ~a~%" type str)))
+    (if type
+        (format #t "~a ~a~%" type str)
+        (format #t "   ~a~%" str)))
   (let ((moment (find-last-saved-history buf n)))
     (if moment
         (let ((now  (text->string (text-of buf)))
               (then (text->string (text-of moment))))
-          (format #t "--- ~a" (sys-ctime (mtime-of moment)))
+          (format #t "--- ~a" (sys-ctime (modified-time-of moment)))
           (format #t "+++ ~a" (sys-ctime (modified-time-of buf)))
           (diff-report then now :writer writer)))))
 
@@ -728,8 +728,7 @@
   (let* ((outbuf (get-buffer-create "*Diff*"))
          (port   (open-output-text-buffer outbuf)))
     (erase outbuf)
-    (with-output-to-port port 
-      (lambda () (print-diff buf n)))
+    (with-output-to-port port (lambda () (print-diff buf n)))
     (close-output-port port)
     (buffer-flatten-text outbuf)
     (select-buffer outbuf)))
