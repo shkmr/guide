@@ -1560,11 +1560,24 @@
 ;;; main to be called from gosh repl
 ;;; 
 (define (guide . args)
-  (sys-system "stty min 1 time 0")  ; SunOS 5.8
-  (if the-editor
-      (call/cc (lambda (k) (resume-guide k)))
-      (with-raw-mode  (lambda () (apply run2 args)))))
 
+  (define (check args)
+    ;; check if all args are valid file name string
+    ;; return #t if error found
+    ;; return #f if no error found
+    (find (lambda (e) (not (string? e))) args))
+
+  (define (print-usage)
+    (print "(guide \"file\" ... )") 'error)
+
+  (cond ((check args) (print-usage))
+        (the-editor
+         (call/cc (lambda (k)
+                    (for-each find-file args)
+                    (resume-guide k))))
+        (else
+         (sys-system "stty min 1 time 0")      ; SunOS 5.8
+         (with-raw-mode  (lambda () (apply run2 args))))))
 ;;;
 ;;;
 ;;;
