@@ -36,6 +36,7 @@
 
 (define (quit . args)
   (apply error (cons <quit> args)))
+
 ;;;
 ;;;  TEXT-BUFFER CLASS
 ;;;
@@ -370,7 +371,6 @@
                :key-map (copy-key-map (global-key-map-of the-editor)))))
     (circular-append! (buffers-of the-editor) buf)
     buf))
-
 
 (define (remove-buffer-from-the-editor buf)
   (if (eq? buf (current-buffer))
@@ -976,8 +976,7 @@
         (set! (start-of win) (text-goto-line (text-of buf) newln))
         (set! (start-of win) 0))))
 
-(define (recenter-window _)
-  (recenter (current-window) _))
+(define (recenter-window _) (recenter (current-window) _))
 
 (define-method scroll-up ((win <text-window>) n)
   (let* ((buf     (buffer-of win))
@@ -990,7 +989,6 @@
           (set! (start-of win) pos)
           (set! (point-of buf) pos))
         (message "End of buffer"))))
-
 (define-method scroll-up (n) (scroll-up (current-window) n))
 
 (define-method scroll-down ((win <text-window>) n)
@@ -1004,7 +1002,6 @@
           (set! (start-of win) pos)
           (set! (point-of buf) pos))
         (message "Beginning of buffer"))))
-
 (define-method scroll-down (arg) (scroll-down (current-window) arg))
 
 ;;;;
@@ -1515,6 +1512,7 @@
     (push! (frames-of editor) frame)))
 
 (define (make-editor cont)
+
   (let ((editor (make <editor>))
         (msgbuf (make <text-buffer> :name "*Messages*")))
 
