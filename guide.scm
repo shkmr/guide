@@ -1360,13 +1360,6 @@
            :accessor continuation-of)
 ))
 
-(define (put-alarm-list! thunk)
-  (push! (alarm-list-of the-editor) thunk))
-
-(define (message . args)
-  ;; Is it better to move to the end of buffer?
-  (apply format (cons (current-error-port) args)))
-
 (define the-editor       #f)
 (define (buffer-list)    (buffers-of the-editor))
 (define (current-buffer) (car (buffer-list)))
@@ -1475,12 +1468,18 @@
     (define-key kmap "\\C-x\\C-x" exchange-point-and-mark)
     ))
 
+(define (put-alarm-list! thunk)
+  (push! (alarm-list-of the-editor) thunk))
+
+(define (message . args)
+  (apply format (cons (current-error-port) args)))
+
 (define (exit-guide arg)
   (for-each delete-frame (frames-of the-editor))
   (let ((e the-editor))
     (set! the-editor #f)
     (if (continuation-of e)
-        ((continuation-of e) 0)
+        ((continuation-of e) 'exit)
         (exit 0))))
 
 (define (suspend-guide arg)
@@ -1531,6 +1530,11 @@
 ;;;
 ;;;  INIT MAIN
 ;;;
+(define (alarm-handler x)
+  (for-each (lambda (x) (x)) (alarm-list-of the-editor))
+  (set! (alarm-list-of the-editor) '())
+  (update-display))
+
 (define (initialize-the-editor cont)
   (set! the-editor (make-editor cont))
   (add-frame the-editor <vt100-frame>)
@@ -1548,24 +1552,24 @@
   (let guide ()
     (let ((status (if the-editor
                       (call/cc (lambda (k) (resume-guide k)))
-                      (with-raw-mode (lambda () (apply run2 (cdr args)))))))
-      (cond ((integer? status) status)
-            (else                       ; 'suspend
-             (sys-kill (sys-getpid) SIGSTOP)
-             (guide)))))
+                      (with-raw-mode (lambda () (apply run (cdr args)))))))
+      (case status
+        ((exit) 0)
+        ((suspend) (sys-kill (sys-getpid) SIGSTOP) (guide))
+        (else   1))))
   ;; Do we need to restore min and time above?
   )
 
 ;;;
-;;; main to be called from gosh repl
+;;; main to be called from gosh's REPL
 ;;; 
 (define (guide . args)
 
   (define (check args)
-    ;; check if all args are valid file name string
+    ;; check if all args are valid filename string
     ;; return #t if error found
     ;; return #f if no error found
-    (find (lambda (e) (not (string? e))) args))
+    (find (lambda (e) (not (string? e))) args)) ; for now
 
   (define (print-usage)
     (print "(guide \"file\" ... )") 'error)
@@ -1587,25 +1591,21 @@
       (with-error-to-port port (lambda () (with-output-to-port port thunk))))
 )
 
-(define (alarm-handler x)
-  (for-each (lambda (x) (x)) (alarm-list-of the-editor))
-  (set! (alarm-list-of the-editor) '())
-  (update-display))
-
 ;;;
 ;;; standard emacs like startup
 ;;;
 (define (run . args)
-  (initialize-the-editor exit)
-  (sync-buffers-and-windows)
-  (let ((errp (open-output-text-buffer (get-buffer "*Messages*"))))
-    (with-output-and-error-to-port errp 
-                                   (lambda () 
-                                     (for-each find-file args)
-                                     (interactive-loop)))))
-
+  (call/cc
+   (lambda (cont)
+     (initialize-the-editor cont)
+     (sync-buffers-and-windows)
+     (let ((errp (open-output-text-buffer (get-buffer "*Messages*"))))
+       (with-output-and-error-to-port errp 
+                                      (lambda () 
+                                        (for-each find-file args)
+                                        (interactive-loop)))))))
 ;;;
-;;; split-window
+;;; split-window with *Messages* on top
 ;;;
 (define (run2 . args)
   (call/cc
@@ -1623,7 +1623,6 @@
                                         (sync-buffers-and-windows)
                                         (switch-to-next-buffer '())
                                         (interactive-loop)))))))
-
 ;;;
 ;;;  VT100 FRAME :-)
 ;;;

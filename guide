@@ -1,0 +1,5 @@
+#!/usr/bin/env gosh
+; -*-Scheme-*-
+(use guide)
+(define (main args)
+  (guide-main args))
