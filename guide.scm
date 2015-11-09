@@ -1729,10 +1729,13 @@
 (define-method display-frame ((frame <vt100-frame>))
 
   (define (display-the-last-line buf)
-    (let* ((text (text-of buf))
-           (to   (text-size text))
-           (from (text-beginning-of-line text to 1)))
-      (print-text text from to)
+    (let* ((text  (text-of buf))
+           (end   (+ (text-size text) 1))
+           (beg   (text-beginning-of-line text end 1))
+           (start (if (< (- end beg) (width-of frame))
+                      beg
+                      (- end (width-of frame)))))
+      (print-text text start end)
       (vt100-clear-eol)))
 
   (define (display-mini-buffer buf)
