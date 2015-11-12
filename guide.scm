@@ -34,8 +34,7 @@
 
 (define-condition-type <quit> <message-condition> #f)
 
-(define (quit . args)
-  (apply error (cons <quit> args)))
+(define (quit . args) (apply error (cons <quit> args)))
 
 ;;;
 ;;;  TEXT-BUFFER CLASS
@@ -89,10 +88,6 @@
   (set! (key-map-of buf)    #f)
   )
 
-(define-method error-if-readonly ((buf <text-buffer>))
-  (if (is-readonly? buf) 
-      (quit "Read only buffer")))
-
 (define (update-buffer buf m pos arg)
 
   (define (do-insert str)
@@ -121,7 +116,7 @@
     (set! (point-of buf) 0)
     (set! (mark-of  buf) 0))
 
-  (error-if-readonly buf)
+  (if (is-readonly? buf)  (quit "Read only buffer"))
 
   (let ((curtime (get-real-time))
         (modtime (modified-time-of buf)))
@@ -139,21 +134,21 @@
   )
 
 (define (buffer-flatten-text buf)
+  ;; flatten does not modify contents of text
   (set! (text-of buf) (text-flatten (text-of buf))))
+
+(define-method insert ((buf <text-buffer>) 
+                       (pos <integer>)
+                       (str <string>))
+  (update-buffer buf 'insert pos str))
+
+(define-method delete ((buf    <text-buffer>)
+                       (pos    <integer>)
+                       (count  <integer>))
+  (update-buffer buf 'delete pos count))
 
 (define (buffer-replace-text buf text)
   (update-buffer buf 'replace 0 text))
-
-(define-method region->string ((buf <text-buffer>)
-                              (from <integer>)
-                              (to   <integer>))
-  (cond ((> from to) (region->string buf to from))
-        ((= from to) "")
-        (else
-         (text->string (text-get-text (text-of buf) from (- to from))))))
-
-(define-method region->string ((buf <text-buffer>))
-  (region->string buf (point-of buf) (mark-of buf)))
 
 (define (buffer-let-window-always-follow-point buf)
   (set! (follow-cursor? buf) #t))
@@ -200,6 +195,23 @@
   (buffer-replace-text buf '())
   (set! (history-of buf) '())
   (set! (is-modified? buf) #f))
+
+(define (buffer-delete-region buf from to)
+  (cond ((= from to) #f)
+        ((> from to) 
+         (buffer-delete-region buf to from))
+        (else
+         (delete buf from (- to from)))))
+
+(define-method region->string ((buf <text-buffer>)
+                              (from <integer>)
+                              (to   <integer>))
+  (cond ((> from to) (region->string buf to from))
+        ((= from to) "")
+        (else
+         (text->string (text-get-text (text-of buf) from (- to from))))))
+(define-method region->string ((buf <text-buffer>))
+  (region->string buf (point-of buf) (mark-of buf)))
 
 (define-method line-number-of ((buf <text-buffer>))
   (let ((text (text-of buf))
@@ -256,7 +268,7 @@
         (set! (modified-time-of buf) (modified-time-of moment))
         )))
 
-(define-method find-history-by-mtime ((buf <text-buffer>)  mtime)
+(define-method find-history-by-mtime ((buf <text-buffer>) mtime)
   (history-find-mtime (history-of buf) mtime))
 
 (define-method find-last-saved-history ((buf <text-buffer>) n)
@@ -505,37 +517,15 @@
 ;;;
 ;;;  EDIT COMMANDS
 ;;;
-(define-command erase (buf)  (buffer-erase buf))
-
-(define-method insert ((buf <text-buffer>) 
-                       (pos <integer>)
-                       (str <string>))
-  (update-buffer buf 'insert pos str))
-  
 
 (define-method insert ((buf <text-buffer>)
                        (str <string>))
   (insert buf (point-of buf) str))
+(define-method insert ((buf <text-buffer>) x) (insert buf (x->string x)))
+(define-method insert (x)                     (insert (current-buffer) x))
 
-(define-method insert ((buf <text-buffer>) x)
-  (insert buf (x->string x)))
-
-(define-method insert (x)  (insert (current-buffer) x))
-
-(define-method delete ((buf    <text-buffer>)
-                       (pos    <integer>)
-                       (count  <integer>))
-  (update-buffer buf 'delete pos count))
-
-(define-command delete (buf count)
-  (delete buf (point-of buf) count))
-
-(define (buffer-delete-region buf from to)
-  (cond ((= from to) #f)
-        ((> from to) 
-         (buffer-delete-region buf to from))
-        (else
-         (delete buf from (- to from)))))
+(define-command delete (buf count)            (delete buf (point-of buf) count))
+(define-command erase (buf)  (buffer-erase buf))
 
 (define-method kill-region ((buf <text-buffer>)
                             (from <integer>)
@@ -885,7 +875,6 @@
            :accessor tmp-point-of)
    (frame  :init-keyword :frame
            :accessor frame-of)))
-   
 
 (define-method get-event ((frame <frame>)) #f)
 (define-method event-pending? ((frame <frame>)) #f)
