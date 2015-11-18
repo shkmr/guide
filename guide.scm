@@ -25,6 +25,21 @@
   (let ((tmp (text-end-of-line text 0 lino)))
     (text-beginning-of-line text tmp 1)))
 
+(define (text-gen-getc text)
+  (let ((i 0)
+        (text text))
+    (lambda ()
+      (let getc ()
+        (cond ((null? text) (eof-object))
+              ((= i (string-length (car text)))
+               (set! text (cdr text))
+               (set! i 0)
+               (getc))
+              ((< i (string-length (car text)))
+               (let ((r (string-ref (car text) i)))
+                 (inc! i)
+                 r))
+              (else (error "something wrong")))))))
 ;;;
 ;;;
 ;;;
@@ -863,15 +878,15 @@
 (define-class <text-window> ()
   ((buffer :init-keyword :buffer
            :accessor buffer-of)
-   (start  :init-value 0        ;; starting point of buffer for display
+   (start  :init-value 0        ; starting point of buffer for display
            :init-keyword :start
            :accessor start-of)
-   (height :init-value 23       ;; number of lines
+   (height :init-value 23       ; number of lines
            :init-keyword :hight
            :accessor height-of)
-   (point  :init-value 0        ;; cursor point
+   (point  :init-value 0        ; cursor point
            :accessor point-of)
-   (tmp    :init-value #f        ;; tmp cursor point
+   (tmp    :init-value #f       ; tmp cursor point
            :accessor tmp-point-of)
    (frame  :init-keyword :frame
            :accessor frame-of)))
@@ -1827,6 +1842,9 @@
   (with-output-to-port (output-port-of frame) out)
   )
 
+;;;
+;;;
+;;;
 ;;(define (vt100-clear-screen)  (display "\x1b[H\x1b[2J"))
 (define (vt100-clear-eol)     (display "\x1b[0K"))
 (define (vt100-clear-bol)     (display "\x1b[1K"))
@@ -1869,6 +1887,7 @@
                            (- (height-of frame) 1))))
 
 (define (vt100-char-width ch)
+  ;; XXX this is not correct!
   (cond ((number? ch) 0)
         ((< (char->ucs ch) 32)  0)
         ((< (char->ucs ch) 256) 1)
@@ -1888,13 +1907,33 @@
   (let ((len (string-length str)))
     (let loop ((i 0)
                (width width))
-      (cond ((>= i len) len)
+      (cond ((> i len) len)
             ((= width 0) i)
             ((< width 0) (if (> i 0) (- i 1) 0))
             (else
              (loop (+ i 1)
                    (- width 
                       (vt100-char-width (string-ref str i 0)))))))))
+
+;;;
+;;; returns list of points.
+;;  Each points is at the beginning of a line.
+;;;
+(define (vt100-beginning-of-lines text width)
+  (define getc (text-gen-getc text))
+  (if (<= width 2) (error "too narrow"))
+  (let lp ((c   (getc))
+           (pos 0)
+           (w   0)
+           (r   (list 0)))
+    (let ((next (+ pos 1)))
+      (cond ((eof-object? c) (reverse r))
+            ((char=? c #\newline)
+             (lp (getc) next 0 (cons next r)))
+            ((>= (+ w (vt100-char-width c)) width)
+             (lp c pos 0 (cons pos r)))
+            (else
+             (lp (getc) next (+ w (vt100-char-width c)) r))))))
 
 ;;;
 ;;; display text inside box of width and height
@@ -1924,8 +1963,7 @@
               (receive (pos wc w h x y)
                   (vt100-display-line (substring str 0 idx) pos wc w h x y full-width)
                 (vt100-clear-eol)
-                (cond ((= h 0)
-                       (values pos wc w 0 x y))
+                (cond ((= h 0) (values pos wc w 0 x y))
                       ((< h 0) (error "h < 0!"))
                       (else
                        (newline)
@@ -1945,9 +1983,12 @@
   (cond ((= h 0) (values pos wc w h x y))
         ((< h 0) (error "h < 0!!"))
         ((string=? str "") (values pos wc w h x y))
+        ((= w 0)
+         (display "\\\n")
+         (vt100-display-line str pos 0 full-width (- h 1) x y full-width))
         (else
-         (let ((dispw (vt100-string-width str (string-length str)))
-               (len   (string-length str)))
+         (let* ((len   (string-length str))
+                (dispw (vt100-string-width str len)))
            (cond ((< dispw w)
                   (display str)
                   (values (- pos len)
@@ -1959,7 +2000,7 @@
                               x)
                           y))
                  (else
-                  (let ((idx (- (vt100-string-index-by-width str w) 1)))
+                  (let ((idx (vt100-string-index-by-width str (- w 1))))
                     (display (substring str 0 idx))
                     (display "\\\n")
                     (vt100-display-line (substring str idx len)
