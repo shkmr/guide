@@ -1838,8 +1838,8 @@
       (flush)
       ))
 
-  ;;(display (with-output-to-string out) (output-port-of frame))
-  (with-output-to-port (output-port-of frame) out)
+  (display (with-output-to-string out) (output-port-of frame))
+  ;;(with-output-to-port (output-port-of frame) out)
   )
 
 ;;;
@@ -1916,8 +1916,8 @@
                       (vt100-char-width (string-ref str i 0)))))))))
 
 ;;;
-;;; returns list of points.
-;;  Each points is at the beginning of a line.
+;;; Returns list of points.
+;;; Each points is at the beginning of a line.
 ;;;
 (define (vt100-beginning-of-lines text width)
   (define getc (text-gen-getc text))
@@ -1935,6 +1935,9 @@
             (else
              (lp (getc) next (+ w (vt100-char-width c)) r))))))
 
+;;;
+;;; find line number of pos from return value of vt100-beginning-of-lines.
+;;;
 (define (vt100-line-number pos lns)
   (if (< pos 0)
       0
@@ -1944,9 +1947,10 @@
               ((< pos (car lns)) ln)
               (else
                (lp (+ ln 1) (cdr lns)))))))
+
 ;;;
-;;; display text inside box of width and height
-;;; returns cursor posision x y and number of empty lines h.
+;;; Display text inside box of width and height.
+;;; Returns cursor posision x y and number of empty lines h.
 ;;;
 (define (vt100-display-text text pos width height)
   (let loop ((text text)
