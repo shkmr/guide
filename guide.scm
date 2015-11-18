@@ -878,7 +878,7 @@
 (define-class <text-window> ()
   ((buffer :init-keyword :buffer
            :accessor buffer-of)
-   (start  :init-value 0        ; starting point of buffer for display
+   (start  :init-value 1        ; starting point of buffer for display
            :init-keyword :start
            :accessor start-of)
    (height :init-value 23       ; number of lines
@@ -975,22 +975,22 @@
   (let* ((len   (height-of win))
          (buf   (buffer-of win))
          (lino  (line-number-of (buffer-of win)))
-         (newln   (- lino (quotient len 2))))
+         (newln (- lino (quotient len 2))))
     (if (> newln 1)
-        (set! (start-of win) (text-goto-line (text-of buf) newln))
-        (set! (start-of win) 0))))
+        (set! (start-of win) newln)
+        (set! (start-of win) 1))))
 
 (define (recenter-window _) (recenter (current-window) _))
 
 (define-method scroll-up ((win <text-window>) n)
   (let* ((buf     (buffer-of win))
-         (sln     (text-line-number (text-of buf) (start-of win)))
+         (sln     (start-of win))
          (hlen    (quotient (height-of win) 2))
          (nol     (number-of-lines-of (buffer-of win)))
          (newln   (+  sln (* hlen n))))
     (if (<= newln  (- nol hlen))
         (let ((pos (text-goto-line (text-of buf) newln)))
-          (set! (start-of win) pos)
+          (set! (start-of win) newln)
           (set! (point-of buf) pos))
         (message "End of buffer"))))
 (define-method scroll-up (n) (scroll-up (current-window) n))
@@ -1003,7 +1003,7 @@
          (newln   (- sln (* hlen n))))
     (if (>= newln 1)
         (let* ((pos (text-goto-line (text-of buf) newln)))
-          (set! (start-of win) pos)
+          (set! (start-of win) newln)
           (set! (point-of buf) pos))
         (message "Beginning of buffer"))))
 (define-method scroll-down (arg) (scroll-down (current-window) arg))
@@ -1776,36 +1776,36 @@
                         (point-of buf))
                        (else
                         (point-of win))))
-           (cln  (text-line-number text pos))
-           (rln  (text-number-of-lines text pos))
-           (tln  (+ cln rln -1))
-           (start-pos (text-beginning-of-line text (start-of win) 1))
-           (start-ln  (text-line-number text start-pos)))
-      ;;
-      ;; XXX: start-of should not be pos of text, linenumber or something.
-      ;;
-      (set! (start-of win) start-pos)
-      (if (<= tln (height-of win))
-          (set! (start-of win) 0))
-      (if (< cln start-ln)
-          (set! (start-of win) (text-beginning-of-line text pos 1)))
-      (if (>= cln (+ start-ln (height-of win)))
-          (set! (start-of win) (+ 1 (text-end-of-line text 0
-                                                      (- cln (height-of win))))))
+           (lns  (vt100-beginning-of-lines text (width-of frame)))
+           (cln  (vt100-line-number pos lns))
+           (tln  (length lns)))
+
+      (if (< (start-of win) 1)     (set! (start-of win) 1))
+      (if (<= tln (height-of win)) (set! (start-of win) 1))
+      (if (<  cln (start-of win))  (set! (start-of win) cln))
+      (if (>= cln (+ (start-of win) (height-of win)))
+          (set! (start-of win) (- cln (height-of win) -1)))
+
       (receive (w h cx cy)
-          (vt100-display-text (text-get-text (text-of buf)
-                                             (start-of win) -1)
-                              (- pos (start-of win))
-                              (width-of frame)
-                              (height-of win))
+          (let* ((start-pos (if (> (start-of win) 0)
+                                (list-ref lns (- (start-of win) 1))
+                                0))
+                 (end-pos   (if (< (+ (start-of win) (height-of win))
+                                   tln)
+                                (list-ref lns (+ (start-of win) (height-of win)))
+                                -1))
+                 (count     (if (> end-pos 0) (- end-pos start-pos) -1)))
+            (vt100-display-text (text-get-text (text-of buf) start-pos count)
+                                (- pos start-pos)
+                                (width-of frame)
+                                (height-of win)))
         (cond ((> cy (height-of win))
                (message "rollover cy=~d  (height-of win)=~d~%" cy (height-of win))
                ;;
                ;; In case cursor is out of window, scroll up.
                ;; This happens line at the bottom is wider than the window.
                ;;
-               (set! (start-of win) (text-end-of-line text (start-of win) 4))
-               (set! (start-of win) (text-beginning-of-line text (start-of win) 1))
+               (inc! (start-of win) -4)
                (vt100-cursor-up (height-of win))
                (display-window win))
               (else
@@ -1935,6 +1935,15 @@
             (else
              (lp (getc) next (+ w (vt100-char-width c)) r))))))
 
+(define (vt100-line-number pos lns)
+  (if (< pos 0)
+      0
+      (let lp ((ln   0)
+               (lns  lns))
+        (cond ((null? lns) ln)
+              ((< pos (car lns)) ln)
+              (else
+               (lp (+ ln 1) (cdr lns)))))))
 ;;;
 ;;; display text inside box of width and height
 ;;; returns cursor posision x y and number of empty lines h.
