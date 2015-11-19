@@ -611,7 +611,7 @@
         (let ((ln (string->number str)))
           (if (and ln (integer? ln) (> ln 0))
               (goto-line buf ln)
-              (message "Invalid number"))))))
+              (message "Invalid line number"))))))
 
 (define-command beginning-of-buffer (buf n)
   (set-mark-command buf)
@@ -1277,6 +1277,11 @@
   (define (two-esc? stack) (equal? stack '(27 27)))
   (define (one-esc? stack) (equal? stack '(27)))
 
+  #;(if (> arg 1)
+      (begin
+        (put-alarm-list! (lambda () (message "~%arg:~d " arg)))
+        (sys-alarm 1)))
+
   (let lp ((e     (wait-for-event))
            (kmap  kmap)
            (stack stack))
@@ -1504,6 +1509,9 @@
   (apply format (cons (current-error-port) args)))
 
 (define (exit-guide arg)
+  (if (> (sys-alarm 0) 0)
+      (for-each (lambda (x) (x)) (reverse (alarm-list-of the-editor))))
+  (set! (alarm-list-of the-editor) '())
   (for-each delete-frame (frames-of the-editor))
   (let ((e the-editor))
     (set! the-editor #f)
@@ -1512,6 +1520,9 @@
         (exit 0))))
 
 (define (suspend-guide arg)
+  (if (> (sys-alarm 0) 0)
+      (for-each (lambda (x) (x)) (reverse (alarm-list-of the-editor))))
+  (set! (alarm-list-of the-editor) '())
   (for-each delete-frame (frames-of the-editor))
   (call/cc (lambda (k)
              (let ((r (continuation-of the-editor)))
@@ -1561,7 +1572,7 @@
 ;;;  INIT MAIN
 ;;;
 (define (alarm-handler x)
-  (for-each (lambda (x) (x)) (alarm-list-of the-editor))
+  (for-each (lambda (x) (x)) (reverse (alarm-list-of the-editor)))
   (set! (alarm-list-of the-editor) '())
   (update-display))
 
