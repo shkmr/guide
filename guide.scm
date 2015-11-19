@@ -605,10 +605,13 @@
   (set! (point-of buf) (text-goto-line (text-of buf) n)))
 
 (define-command goto-line-interactive (buf n)
-  (let ((ln (string->number (read-from-mini-buffer "Goto line: " '()))))
-    (if (and ln (integer? ln) (> ln 0))
-        (goto-line buf ln)
-        (message "Invalid number"))))
+  (let ((str (read-from-mini-buffer #"Goto line (default ~|n|): " '())))
+    (if (string-null? str)
+        (goto-line buf n)
+        (let ((ln (string->number str)))
+          (if (and ln (integer? ln) (> ln 0))
+              (goto-line buf ln)
+              (message "Invalid number"))))))
 
 (define-command beginning-of-buffer (buf n)
   (set-mark-command buf)
@@ -1265,32 +1268,57 @@
                :key (get-event (car (frames-of the-editor)))))))
 
 (define (interactive-loop1 arg kmap stack)
-
+  ;; XXX ugly...
+  
   (define (unbound-error stack)
     (errorf <quit> "~a is not defined" (key-stack->string stack)))
 
-  (let* ((e     (wait-for-event))
-         (frame (frame-of e))
-         (key   (key-of e))
-         (obj   (key-map-get kmap key)))
-    (cond ((key-map? obj)
-           (interactive-loop1 arg obj (cons key stack)))
-          ((symbol? obj)
-           (message "~a: not implemented yet" obj))
-          ((eq? key 7) 
-           (erase-echo-area frame)
-           (keyboard-quit frame 1))
-          ((not obj)
-           (erase-echo-area frame)
-           (if (null? stack)
-               (insert (integer->char key))
-               (unbound-error (cons key stack))))
-          ((procedure? obj)
-           (erase-echo-area frame)
-           (obj arg))
-          (else
-           (erase-echo-area frame)
-           (unbound-error (cons key stack))))))
+  (define (num-key? key)   (<= 48 key 57))
+  (define (two-esc? stack) (equal? stack '(27 27)))
+  (define (one-esc? stack) (equal? stack '(27)))
+
+  (let lp ((e     (wait-for-event))
+           (kmap  kmap)
+           (stack stack))
+
+    (let* ((frame (frame-of e))
+           (key   (key-of   e))
+           (obj   (key-map-get kmap key)))
+
+      (cond ((symbol? obj)
+             (message "~a: not implemented yet" obj))
+            ((eq? key 7)
+             (erase-echo-area frame)
+             (keyboard-quit frame 1))
+            ((and (null? stack)
+                  (= key 27)) 
+             (interactive-loop1 arg kmap '(27)))
+            ((and (one-esc? stack)
+                  (= key 27))
+             (interactive-loop1 arg kmap '(27)))
+            ((and (one-esc? stack)
+                  (num-key? key))
+             (interactive-loop1 (- key 48) kmap '(27 27)))
+            ((and (two-esc? stack)
+                  (num-key? key))
+             (interactive-loop1 (+ (* arg 10) (- key 48)) kmap stack))
+            ((one-esc? stack)
+             (if (key-map? (key-map-get kmap 27))
+                 (lp e (key-map-get kmap 27) '(27))
+                 (lp e kmap '())))
+            ((two-esc? stack) (lp e kmap '()))
+            ((key-map? obj)   (interactive-loop1 arg obj (cons key stack)))
+            ((not obj)
+             (erase-echo-area frame)
+             (if (null? stack)
+                 (insert (integer->char key))
+                 (unbound-error (cons key stack))))
+            ((procedure? obj)
+             (erase-echo-area frame)
+             (obj arg))
+            (else
+             (erase-echo-area frame)
+             (unbound-error (cons key stack)))))))
 
 (define (erase-echo-area frame)
   (let* ((buf (get-buffer "*Messages*"))
@@ -1936,7 +1964,7 @@
              (lp (getc) next (+ w (vt100-char-width c)) r))))))
 
 ;;;
-;;; find line number of pos from return value of vt100-beginning-of-lines.
+;;; find line number of pos from lns returned by vt100-beginning-of-lines.
 ;;;
 (define (vt100-line-number pos lns)
   (if (< pos 0)
