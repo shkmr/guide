@@ -88,19 +88,19 @@
    ))
 
 (define (reinitialize-buffer buf)
-  (set! (text-of buf)       '())
-  (set! (point-of buf)       0)
-  (set! (mark-of buf)        0)
-  (set! (name-of buf)        #f)
-  (set! (follow-cursor? buf) #f)
-  (set! (is-persistent? buf) #f)
-  (set! (is-modified? buf)   #f)
-  (set! (is-readonly? buf)   #t)
+  (set! (text-of buf)         '())
+  (set! (point-of buf)         0)
+  (set! (mark-of buf)          0)
+  (set! (name-of buf)          #f)
+  (set! (follow-cursor? buf)   #f)
+  (set! (is-persistent? buf)   #f)
+  (set! (is-modified? buf)     #f)
+  (set! (is-readonly? buf)     #t)
   (set! (modified-time-of buf) 0)
-  (set! (filename-of buf)    #f)
-  (set! (mtime-of buf)       0)
-  (set! (history-of buf)    '())
-  (set! (key-map-of buf)    #f)
+  (set! (filename-of buf)      #f)
+  (set! (mtime-of buf)         0)
+  (set! (history-of buf)      '())
+  (set! (key-map-of buf)       #f)
   )
 
 (define (update-buffer buf m pos arg)
@@ -723,7 +723,7 @@
   (define (writer str type)
     (if type
         (format #t "~a ~a~%" type str)
-        (format #t "   ~a~%" str)))
+        (format #t "  ~a~%" str)))
   (let ((moment (find-last-saved-history buf n)))
     (if moment
         (let ((now  (text->string (text-of buf)))
@@ -1343,7 +1343,7 @@
     (format (current-error-port)
             "*** ERROR: ~a"
             (slot-ref c 'message))
-    (report-error c)
+    #;(report-error c)
     (interactive-loop))
 
   (define (handle-quit c)
@@ -1550,7 +1550,7 @@
     (set! (current-window-of frame) window)
 
     (set! (buffer-of window) (car (buffers-of editor)))
-    (set! (height-of window) (- (height-of frame) 3))
+    (set! (height-of window) (- (height-of frame) 2))
 
     (push! (frames-of editor) frame)))
 
@@ -1923,7 +1923,7 @@
   (let ((minibuf (mini-buffer-of frame)))
     (vt100-cursor-position (+ (string-length (prompt-of minibuf))
                               (point-of minibuf) 1)
-                           (- (height-of frame) 1))))
+                           (- (height-of frame) 0))))
 
 (define (vt100-char-width ch)
   ;; XXX this is not correct!
