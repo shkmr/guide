@@ -1676,6 +1676,7 @@
 (define-method delete-frame ((frame <vt100-frame>))
   (with-output-to-port (output-port-of frame)
     (lambda ()
+      (vt100-scroll-down)
       (vt100-cursor-position 1 (height-of frame))
       (vt100-show-cursor)
       (flush)
@@ -1893,6 +1894,8 @@
 (define (vt100-clear-screen)  (display "\x1b[2J"))
 (define (vt100-reverse-video) (display "\x1b[7m"))
 (define (vt100-normal-video)  (display "\x1b[0m"))
+(define (vt100-scroll-up)     (display "\x1b[D"))
+(define (vt100-scroll-down)   (display "\x1b[M"))
 
 (define (vt100-hide-cursor)   (display "\x1b[?25l"))
 (define (vt100-show-cursor)   (display "\x1b[?25h"))
